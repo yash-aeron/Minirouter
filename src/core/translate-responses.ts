@@ -5,6 +5,7 @@
  */
 import {
   IRContentBlock,
+  IRFinishReason,
   IRRequest,
   IRResponse,
   IRStreamEvent,
@@ -12,7 +13,7 @@ import {
   randomId,
   textOf,
 } from './ir.js';
-import { sseFormat } from './sse.js';
+import { parseSSE, sseFormat } from './sse.js';
 
 /* ---------------------------- client -> IR ---------------------------- */
 
@@ -326,4 +327,277 @@ function responsesUsage(u: IRUsage): Record<string, number> {
     output_tokens: u.outputTokens ?? 0,
     total_tokens: (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
   };
+}
+
+/* ---------------------------- IR -> provider request ---------------------------- */
+
+/**
+ * Serialize the IR for an OpenAI Responses upstream (the Codex backend speaks
+ * this shape). System text becomes `instructions`; Anthropic-only fields are
+ * dropped because the wire protocol has no place for them.
+ */
+export function irToResponsesRequest(ir: IRRequest, model: string): Record<string, unknown> {
+  const instructionParts: string[] = [];
+  if (ir.systemBlocks?.length) {
+    for (const block of ir.systemBlocks) if (block.text) instructionParts.push(block.text);
+  } else if (ir.system) {
+    instructionParts.push(ir.system);
+  }
+
+  const input: Array<Record<string, unknown>> = [];
+  for (const message of ir.messages) {
+    if (message.role === 'system') {
+      const text = textOf(message.content);
+      if (text) instructionParts.push(text);
+      continue;
+    }
+    if (message.role === 'tool') {
+      const output = textOf(message.content);
+      const callId = message.toolCallId ?? '';
+      if (callId) input.push({ type: 'function_call_output', call_id: callId, output });
+      continue;
+    }
+    const textParts: string[] = [];
+    const images: Array<Record<string, unknown>> = [];
+    for (const block of message.content) {
+      if (block.type === 'text') {
+        if (block.text) textParts.push(block.text);
+      } else if (block.type === 'image') {
+        images.push({
+          type: 'input_image',
+          image_url: block.url ?? `data:${block.mediaType};base64,${block.base64}`,
+        });
+      } else if (block.type === 'tool_call' && message.role === 'assistant') {
+        input.push({
+          type: 'function_call',
+          call_id: block.id,
+          name: block.name,
+          arguments: block.arguments || '{}',
+        });
+      }
+    }
+    if (message.role === 'assistant') {
+      const text = textParts.join('');
+      if (text) {
+        input.push({
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text, annotations: [] }],
+        });
+      }
+    } else if (textParts.length || images.length) {
+      const content: Array<Record<string, unknown>> = [];
+      for (const text of textParts) content.push({ type: 'input_text', text });
+      content.push(...images);
+      input.push({ type: 'message', role: 'user', content });
+    }
+  }
+
+  const request: Record<string, unknown> = {
+    model,
+    input,
+    stream: ir.stream,
+  };
+  const instructions = instructionParts.filter(Boolean).join('\n\n');
+  if (instructions) request.instructions = instructions;
+  if (ir.tools.length) {
+    request.tools = ir.tools.map((tool) => ({
+      type: 'function',
+      name: tool.name,
+      ...(tool.description ? { description: tool.description } : {}),
+      parameters: tool.parameters ?? { type: 'object', properties: {} },
+      strict: false,
+    }));
+    request.tool_choice =
+      ir.toolChoice?.type === 'tool'
+        ? { type: 'function', name: ir.toolChoice.name }
+        : (ir.toolChoice?.type ?? 'auto');
+  }
+  if (ir.maxTokens !== undefined) request.max_output_tokens = ir.maxTokens;
+  if (ir.temperature !== undefined) request.temperature = ir.temperature;
+  if (ir.topP !== undefined) request.top_p = ir.topP;
+  return request;
+}
+
+/* ---------------------------- provider response -> IR ---------------------------- */
+
+export function responsesResponseToIR(json: Record<string, any>, model: string): IRResponse {
+  const content: IRContentBlock[] = [];
+  for (const item of Array.isArray(json.output) ? json.output : []) {
+    if (item?.type === 'message') {
+      for (const part of Array.isArray(item.content) ? item.content : []) {
+        if ((part?.type === 'output_text' || part?.type === 'text') && typeof part.text === 'string' && part.text) {
+          content.push({ type: 'text', text: part.text });
+        }
+      }
+    } else if (item?.type === 'function_call') {
+      content.push({
+        type: 'tool_call',
+        id: String(item.call_id ?? item.id ?? randomId('call')),
+        name: String(item.name ?? ''),
+        arguments: argumentsToString(item.arguments),
+      });
+    }
+  }
+
+  const hasToolCall = content.some((b) => b.type === 'tool_call');
+  let finish: IRFinishReason = hasToolCall ? 'tool_calls' : 'stop';
+  if (json.status === 'incomplete') {
+    const reason = json.incomplete_details?.reason;
+    finish = reason === 'max_output_tokens' ? 'length' : reason === 'content_filter' ? 'content_filter' : 'stop';
+  }
+
+  return { model, content, finish, usage: usageFromResponses(json.usage) };
+}
+
+function argumentsToString(value: unknown): string {
+  if (typeof value === 'string') return value || '{}';
+  if (value && typeof value === 'object') return JSON.stringify(value);
+  return '{}';
+}
+
+function responseNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function usageFromResponses(usage: any): IRUsage {
+  if (!usage || typeof usage !== 'object') return {};
+  const result: IRUsage = {};
+  const input = responseNumber(usage.input_tokens);
+  const output = responseNumber(usage.output_tokens);
+  const cached = responseNumber(usage.input_tokens_details?.cached_tokens);
+  if (input !== undefined) result.inputTokens = input;
+  if (output !== undefined) result.outputTokens = output;
+  if (cached !== undefined) result.cacheReadTokens = cached;
+  return result;
+}
+
+/* ---------------------------- provider SSE -> IR events ---------------------------- */
+
+/**
+ * Parse a Responses SSE stream (Codex backend) into IR stream events.
+ *
+ * Function calls carry two ids: the item id (used by delta events) and the
+ * call id (used by the follow-up `function_call_output`). Deltas are remapped
+ * to the call id so tool round-trips work.
+ */
+export async function* responsesSSEToIREvents(
+  body: AsyncIterable<Uint8Array>,
+): AsyncGenerator<IRStreamEvent> {
+  const itemToCall = new Map<string, string>();
+  const started = new Set<string>();
+  const argsEmitted = new Set<string>();
+  let sawToolCall = false;
+  let usage: IRUsage = {};
+
+  const startFunctionCall = (item: Record<string, any>): IRStreamEvent | null => {
+    const callId = String(item.call_id ?? item.id ?? randomId('call'));
+    const itemId = String(item.id ?? callId);
+    itemToCall.set(itemId, callId);
+    sawToolCall = true;
+    if (started.has(itemId)) return null;
+    started.add(itemId);
+    return { type: 'tool_call_start', id: callId, name: String(item.name ?? '') };
+  };
+
+  const emitArgs = (itemId: string, args: unknown): IRStreamEvent | null => {
+    if (!itemId || argsEmitted.has(itemId)) return null;
+    argsEmitted.add(itemId);
+    const callId = itemToCall.get(itemId);
+    if (!callId) return null;
+    return { type: 'tool_call_delta', id: callId, argumentsDelta: argumentsToString(args) };
+  };
+
+  for await (const event of parseSSE(body)) {
+    if (event.data === '[DONE]') break;
+    let payload: any;
+    try {
+      payload = JSON.parse(event.data);
+    } catch {
+      continue;
+    }
+    const type = String(payload?.type ?? event.event ?? '');
+
+    switch (type) {
+      case 'response.output_text.delta':
+      case 'response.refusal.delta': {
+        const delta = payload.delta;
+        if (typeof delta === 'string' && delta) yield { type: 'text_delta', text: delta };
+        break;
+      }
+      case 'response.output_item.added':
+      case 'response.output_item.done': {
+        const item = payload.item;
+        if (item?.type !== 'function_call') break;
+        const start = startFunctionCall(item);
+        if (start) yield start;
+        if (item.arguments !== undefined && item.arguments !== '') {
+          const delta = emitArgs(String(item.id ?? item.call_id ?? ''), item.arguments);
+          if (delta) yield delta;
+        }
+        break;
+      }
+      case 'response.function_call_arguments.delta': {
+        const itemId = String(payload.item_id ?? '');
+        const delta = payload.delta;
+        if (typeof delta === 'string' && delta && itemId) {
+          argsEmitted.add(itemId);
+          const callId = itemToCall.get(itemId);
+          if (callId) yield { type: 'tool_call_delta', id: callId, argumentsDelta: delta };
+        }
+        break;
+      }
+      case 'response.function_call_arguments.done': {
+        const itemId = String(payload.item_id ?? '');
+        const delta = emitArgs(itemId, payload.arguments);
+        if (delta) yield delta;
+        break;
+      }
+      case 'response.completed':
+      case 'response.incomplete':
+      case 'response.done': {
+        const response = payload.response ?? payload;
+        // Some backends only include function calls in the final response.
+        for (const item of Array.isArray(response?.output) ? response.output : []) {
+          if (item?.type !== 'function_call') continue;
+          const start = startFunctionCall(item);
+          if (start) yield start;
+          const delta = emitArgs(String(item.id ?? item.call_id ?? ''), item.arguments);
+          if (delta) yield delta;
+        }
+        usage = { ...usage, ...usageFromResponses(response?.usage) };
+        if (Object.keys(usage).length) yield { type: 'usage', usage };
+        const incomplete = response?.status === 'incomplete';
+        const reason = incomplete ? response?.incomplete_details?.reason : undefined;
+        const finish: IRFinishReason = incomplete
+          ? reason === 'max_output_tokens'
+            ? 'length'
+            : reason === 'content_filter'
+              ? 'content_filter'
+              : 'stop'
+          : sawToolCall
+            ? 'tool_calls'
+            : 'stop';
+        yield { type: 'finish', reason: finish };
+        return;
+      }
+      case 'response.failed': {
+        const response = payload.response ?? payload;
+        const message = response?.error?.message ?? payload?.error?.message ?? 'upstream response failed';
+        yield { type: 'error', message: String(message) };
+        return;
+      }
+      case 'error': {
+        const message = payload?.error?.message ?? payload?.message ?? 'upstream stream error';
+        yield { type: 'error', message: String(message) };
+        return;
+      }
+      default:
+        break;
+    }
+  }
+
+  // The stream ended without a completion event: surface it as an error rather
+  // than a silent clean stop.
+  yield { type: 'error', message: 'upstream stream ended without a completion event' };
 }
