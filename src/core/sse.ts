@@ -45,24 +45,49 @@ export function sseFormat(data: string, event?: string): string {
   return `${lines.join('\n')}\n\n`;
 }
 
-/** Collect an async iterable of strings into a single Response body string chunk-wise. */
-export function sseStream(events: AsyncGenerator<string>): ReadableStream<Uint8Array> {
-  const encoder = new TextEncoder();
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      try {
-        const { value, done } = await events.next();
-        if (done) {
-          controller.close();
-        } else {
-          controller.enqueue(encoder.encode(value));
-        }
-      } catch (err) {
-        controller.error(err);
+/**
+ * Pass chunks through, emitting `ping` whenever the source is idle for
+ * `intervalMs`. Keeps a single in-flight `next()` so no chunk is lost when a
+ * timeout wins the race.
+ */
+export async function* heartbeat(
+  source: AsyncIterable<string>,
+  ping: string,
+  intervalMs = 15_000,
+): AsyncGenerator<string> {
+  const iterator = source[Symbol.asyncIterator]();
+  let pending: Promise<IteratorResult<string>> | null = null;
+  let finished = false;
+  try {
+    while (true) {
+      if (!pending) pending = iterator.next();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<{ kind: 'timeout' }>((resolve) => {
+        timer = setTimeout(() => resolve({ kind: 'timeout' }), intervalMs);
+      });
+      const outcome = await Promise.race([
+        pending.then((value) => ({ kind: 'value' as const, value })),
+        timeout,
+      ]);
+      clearTimeout(timer);
+      if (outcome.kind === 'timeout') {
+        yield ping;
+        continue;
       }
-    },
-    cancel(reason) {
-      void events.return?.(reason);
-    },
-  });
+      pending = null;
+      if (outcome.value.done) {
+        finished = true;
+        return;
+      }
+      yield outcome.value.value;
+    }
+  } finally {
+    if (!finished) {
+      try {
+        await iterator.return?.(undefined);
+      } catch {
+        // the source is already failing; nothing to clean up
+      }
+    }
+  }
 }
