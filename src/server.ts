@@ -380,7 +380,7 @@ export async function runServer(runOpts: RunOptions): Promise<{ close: () => voi
   const usage = new UsageStore(runOpts.dataDir);
   let state: State = {
     config,
-    registry: buildRegistry(config),
+    registry: buildRegistry(config, { dataDir: runOpts.dataDir }),
     breakers: new Breakers(),
     chain: new ChainResolver(config),
     usage,
@@ -391,7 +391,7 @@ export async function runServer(runOpts: RunOptions): Promise<{ close: () => voi
       const next = loadConfig(runOpts.configPath);
       state = {
         config: next.config,
-        registry: buildRegistry(next.config),
+        registry: buildRegistry(next.config, { dataDir: runOpts.dataDir }),
         breakers: new Breakers(),
         chain: new ChainResolver(next.config),
         usage,
