@@ -77,7 +77,8 @@ export class UsageStore {
                 COALESCE(SUM(CASE WHEN ok THEN 1 ELSE 0 END), 0) AS ok_requests,
                 COALESCE(SUM(input_tokens), 0) AS input_tokens,
                 COALESCE(SUM(output_tokens), 0) AS output_tokens,
-                COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens
+                COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens
          FROM requests`,
       )
       .get() as Record<string, number>;
@@ -99,7 +100,8 @@ export class UsageStore {
       .all() as Array<Record<string, unknown>>;
     const recent = this.db
       .prepare(
-        `SELECT ts, route, provider, model, stream, input_tokens, output_tokens, ok, error, duration_ms
+        `SELECT ts, route, provider, model, stream, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, ok, error, duration_ms
          FROM requests ORDER BY ts DESC LIMIT 50`,
       )
       .all() as Array<Record<string, unknown>>;

@@ -8,11 +8,12 @@ import { Breakers } from './router/breaker.js';
 import { ChainResolver } from './router/chain.js';
 import { executeWithFailover, NoCandidateError } from './router/failover.js';
 import { ProviderError } from './providers/types.js';
-import { IRRequest, IRUsage } from './core/ir.js';
+import { IRRequest, IRStreamEvent, IRUsage } from './core/ir.js';
 import {
+  anthropicRequestToIR,
+  anthropicStreamError,
   irEventsToAnthropicSSE,
   irToAnthropicResponse,
-  anthropicRequestToIR,
 } from './core/translate-anthropic.js';
 import {
   irEventsToOpenAISSE,
@@ -25,8 +26,10 @@ import {
   irToResponsesResponse,
   responsesRequestToIR,
 } from './core/translate-responses.js';
-import { sseStream } from './core/sse.js';
+import { heartbeat, sseFormat } from './core/sse.js';
 import { UsageStore } from './usage/store.js';
+
+type WireFormat = 'anthropic' | 'openai' | 'responses';
 
 interface State {
   config: AppConfig;
@@ -44,12 +47,22 @@ interface AppOptions {
   rebuild: () => void;
 }
 
-function errorStatus(err: unknown): { status: number; message: string } {
+interface ErrorInfo {
+  status: number;
+  message: string;
+  /** set when the error came from an upstream provider and can be relayed */
+  upstream?: ProviderError;
+}
+
+function errorStatus(err: unknown): ErrorInfo {
   if (err instanceof NoCandidateError) {
-    return { status: 502, message: err.message };
+    const last = err.lastError;
+    // Preserve rate-limit / payment semantics so clients back off correctly.
+    const status = last?.status === 429 ? 429 : last?.status === 402 ? 402 : 502;
+    return { status, message: err.message, upstream: last };
   }
   if (err instanceof ProviderError) {
-    return { status: err.status >= 400 ? err.status : 502, message: err.message };
+    return { status: err.status >= 400 ? err.status : 502, message: err.message, upstream: err };
   }
   return {
     status: 400,
@@ -69,13 +82,59 @@ function emptyUsage(): IRUsage {
   return { inputTokens: 0, outputTokens: 0 };
 }
 
+/** Headers that carry client capabilities and must reach the upstream verbatim. */
+const FORWARDED_HEADER_PREFIXES = ['anthropic-', 'x-claude-code-'];
+
+function collectClientHeaders(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of headers.entries()) {
+    const name = key.toLowerCase();
+    if (FORWARDED_HEADER_PREFIXES.some((prefix) => name.startsWith(prefix))) {
+      out[name] = value;
+    }
+  }
+  return out;
+}
+
+function heartbeatIntervalMs(): number {
+  const override = Number(process.env.MINIROUTE_HEARTBEAT_MS);
+  return Number.isFinite(override) && override > 0 ? override : 15_000;
+}
+
+function terminalErrorFrame(format: WireFormat, message: string): string {
+  if (format === 'anthropic') return anthropicStreamError(message);
+  if (format === 'responses') {
+    return sseFormat(
+      JSON.stringify({
+        type: 'response.failed',
+        response: { status: 'failed', error: { code: 'upstream_error', message } },
+      }),
+      'response.failed',
+    );
+  }
+  return (
+    sseFormat(JSON.stringify({ error: { message, type: 'api_error', code: null } })) +
+    sseFormat('[DONE]')
+  );
+}
+
 export function createApp(opts: AppOptions): Hono {
   const app = new Hono();
 
   // Every /v1 route passes through auth — no exceptions (the OmniRoute RCE
-  // came from a route missing from its auth table).
+  // came from a route missing from its auth table). Accept both credential
+  // headers because Claude Code and the Anthropic SDKs use x-api-key.
   app.use('/v1/*', async (c, next) => {
-    if (opts.authEnabled && !checkAuth(c.req.header('authorization'), opts.apiKey)) {
+    const ok =
+      !opts.authEnabled ||
+      checkAuth(
+        {
+          authorization: c.req.header('authorization'),
+          xApiKey: c.req.header('x-api-key'),
+        },
+        opts.apiKey,
+      );
+    if (!ok) {
       return c.json({ error: { message: 'invalid or missing API key', type: 'authentication_error' } }, 401);
     }
     await next();
@@ -95,11 +154,70 @@ export function createApp(opts: AppOptions): Hono {
     return c.json(opts.state.usage.summary());
   });
 
+  const respondError = (c: any, info: ErrorInfo): Response => {
+    // Error style follows the route the client called.
+    const path = c.req.path as string;
+    const anthropic = path.startsWith('/v1/messages');
+    const headers = info.upstream?.upstreamHeaders ?? {};
+
+    // If the upstream already produced an error body in this client's wire
+    // format, pass it through untouched: Claude Code inspects error.type to
+    // decide whether to retry, compact, or ask for a smaller request.
+    const raw = info.upstream?.rawBody;
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as Record<string, any>;
+        const matchesFormat = anthropic
+          ? parsed?.type === 'error' &&
+            typeof parsed.error === 'object' &&
+            parsed.error !== null
+          : parsed?.error !== null &&
+            typeof parsed?.error === 'object' &&
+            typeof parsed.error.message === 'string' &&
+            parsed.type === undefined;
+        if (matchesFormat) {
+          return c.json(parsed, info.status as any, headers);
+        }
+      } catch {
+        // not JSON: fall through to a wrapped error
+      }
+    }
+
+    const body = anthropic ? anthropicError(info.status, info.message) : openaiError(info.status, info.message);
+    return c.json(body, info.status as any, headers);
+  };
+
+  const streamResponse = (
+    c: any,
+    events: AsyncIterable<IRStreamEvent>,
+    model: string,
+    format: WireFormat,
+  ): Response => {
+    const source =
+      format === 'anthropic'
+        ? irEventsToAnthropicSSE(events, model)
+        : format === 'responses'
+          ? irEventsToResponsesSSE(events, model)
+          : irEventsToOpenAISSE(events, model, true);
+    const ping = format === 'anthropic' ? 'event: ping\ndata: {"type":"ping"}\n\n' : ': keep-alive\n\n';
+    return streamText(c, async (s) => {
+      try {
+        for await (const chunk of heartbeat(source, ping, heartbeatIntervalMs())) {
+          await s.write(chunk);
+        }
+      } catch (err) {
+        // The connection is still open and the client has already seen a 200,
+        // so the only way to report truncation is a terminal error event.
+        await s.write(terminalErrorFrame(format, err instanceof Error ? err.message : String(err)));
+      }
+    });
+  };
+
   const handle = (
     routeName: string,
     parseToIR: (body: Record<string, unknown>) => IRRequest,
     respondNonStreaming: (c: any, result: any, model: string) => Response,
-    respondStreaming: (c: any, events: AsyncIterable<any>, model: string) => Response,
+    format: WireFormat,
     logUsage: boolean,
   ) =>
     async (c: any): Promise<Response> => {
@@ -110,11 +228,16 @@ export function createApp(opts: AppOptions): Hono {
         ir = parseToIR(body);
       } catch (err) {
         const { status, message } = errorStatus(err);
-        return respondError(c, status, `invalid request: ${message}`);
+        return respondError(c, { status, message: `invalid request: ${message}` });
       }
+      ir.clientHeaders = collectClientHeaders(c.req.raw.headers);
 
       try {
-        const candidates = opts.state.chain.resolve(ir.model);
+        const warnings: string[] = [];
+        const candidates = opts.state.chain.resolve(ir.model, warnings);
+        for (const warning of warnings) {
+          console.warn(`[miniroute] route "${ir.model}": ${warning}`);
+        }
         const result = await executeWithFailover(
           ir,
           candidates,
@@ -125,33 +248,42 @@ export function createApp(opts: AppOptions): Hono {
         if (ir.stream) {
           // Record usage from stream events without blocking serialization.
           const usage: IRUsage = emptyUsage();
-          const tap = async function* (src: AsyncIterable<any>) {
-            for await (const ev of src) {
-              if (ev.type === 'usage' && ev.usage) {
-                usage.inputTokens += ev.usage.inputTokens ?? 0;
-                usage.outputTokens += ev.usage.outputTokens ?? 0;
-                usage.cacheReadTokens = (usage.cacheReadTokens ?? 0) + (ev.usage.cacheReadTokens ?? 0);
-                usage.cacheWriteTokens = (usage.cacheWriteTokens ?? 0) + (ev.usage.cacheWriteTokens ?? 0);
+          let failure: string | undefined;
+          const tap = async function* (src: AsyncIterable<IRStreamEvent>) {
+            try {
+              for await (const ev of src) {
+                if (ev.type === 'usage' && ev.usage) {
+                  usage.inputTokens = (usage.inputTokens ?? 0) + (ev.usage.inputTokens ?? 0);
+                  usage.outputTokens = (usage.outputTokens ?? 0) + (ev.usage.outputTokens ?? 0);
+                  usage.cacheReadTokens = (usage.cacheReadTokens ?? 0) + (ev.usage.cacheReadTokens ?? 0);
+                  usage.cacheWriteTokens = (usage.cacheWriteTokens ?? 0) + (ev.usage.cacheWriteTokens ?? 0);
+                }
+                if (ev.type === 'error') failure = ev.message;
+                yield ev;
               }
-              yield ev;
-            }
-            if (logUsage) {
-              opts.state.usage.insert({
-                ts: Date.now(),
-                route: routeName,
-                provider: result.provider,
-                model: result.model,
-                stream: true,
-                inputTokens: usage.inputTokens ?? 0,
-                outputTokens: usage.outputTokens ?? 0,
-                cacheReadTokens: usage.cacheReadTokens ?? 0,
-                cacheWriteTokens: usage.cacheWriteTokens ?? 0,
-                ok: true,
-                durationMs: Date.now() - started,
-              });
+            } catch (err) {
+              failure = err instanceof Error ? err.message : String(err);
+              throw err;
+            } finally {
+              if (logUsage) {
+                opts.state.usage.insert({
+                  ts: Date.now(),
+                  route: routeName,
+                  provider: result.provider,
+                  model: result.model,
+                  stream: true,
+                  inputTokens: usage.inputTokens ?? 0,
+                  outputTokens: usage.outputTokens ?? 0,
+                  cacheReadTokens: usage.cacheReadTokens ?? 0,
+                  cacheWriteTokens: usage.cacheWriteTokens ?? 0,
+                  ok: !failure,
+                  ...(failure ? { error: failure.slice(0, 500) } : {}),
+                  durationMs: Date.now() - started,
+                });
+              }
             }
           };
-          return respondStreaming(c, tap(result.events!), result.model);
+          return streamResponse(c, tap(result.events!), result.model, format);
         }
 
         const resp = result.response!;
@@ -172,7 +304,7 @@ export function createApp(opts: AppOptions): Hono {
         }
         return respondNonStreaming(c, result, result.model);
       } catch (err) {
-        const { status, message } = errorStatus(err);
+        const info = errorStatus(err);
         opts.state.usage.insert({
           ts: Date.now(),
           route: routeName,
@@ -184,24 +316,12 @@ export function createApp(opts: AppOptions): Hono {
           cacheReadTokens: 0,
           cacheWriteTokens: 0,
           ok: false,
-          error: message.slice(0, 500),
+          error: info.message.slice(0, 500),
           durationMs: Date.now() - started,
         });
-        return respondError(c, status, message);
+        return respondError(c, info);
       }
     };
-
-  const respondError = (c: any, status: number, message: string): Response => {
-    // Error style follows the route the client called.
-    const path = c.req.path as string;
-    if (path.startsWith('/v1/messages')) {
-      return c.json(anthropicError(status, message), status as any);
-    }
-    if (path.startsWith('/v1/responses')) {
-      return c.json(openaiError(status, message), status as any);
-    }
-    return c.json(openaiError(status, message), status as any);
-  };
 
   /* ---- OpenAI chat completions ---- */
   app.post(
@@ -210,10 +330,7 @@ export function createApp(opts: AppOptions): Hono {
       'chat',
       (b) => openaiChatRequestToIR(b as OpenAIChatRequest),
       (c, result, model) => c.json(irToOpenAIChatResponse(result.response!, model)),
-      (c, events, model) =>
-        streamText(c, async (s) => {
-          for await (const chunk of irEventsToOpenAISSE(events, model, true)) await s.write(chunk);
-        }),
+      'openai',
       true,
     ),
   );
@@ -225,10 +342,7 @@ export function createApp(opts: AppOptions): Hono {
       'messages',
       (b) => anthropicRequestToIR(b),
       (c, result, model) => c.json(irToAnthropicResponse({ ...result.response!, model })),
-      (c, events, model) =>
-        streamText(c, async (s) => {
-          for await (const chunk of irEventsToAnthropicSSE(events, model)) await s.write(chunk);
-        }),
+      'anthropic',
       true,
     ),
   );
@@ -240,10 +354,7 @@ export function createApp(opts: AppOptions): Hono {
       'responses',
       (b) => responsesRequestToIR(b),
       (c, result, model) => c.json(irToResponsesResponse({ ...result.response!, model })),
-      (c, events, model) =>
-        streamText(c, async (s) => {
-          for await (const chunk of irEventsToResponsesSSE(events, model)) await s.write(chunk);
-        }),
+      'responses',
       true,
     ),
   );

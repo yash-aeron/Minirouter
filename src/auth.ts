@@ -6,6 +6,13 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
+export interface ClientCredentials {
+  /** `Authorization: Bearer <key>` */
+  authorization?: string;
+  /** `x-api-key: <key>` — what Anthropic SDKs and Claude Code send */
+  xApiKey?: string;
+}
+
 export function ensureApiKey(dataDir: string): string {
   fs.mkdirSync(dataDir, { recursive: true });
   const file = path.join(dataDir, 'api-key');
@@ -23,11 +30,19 @@ export function ensureApiKey(dataDir: string): string {
   return key;
 }
 
-export function checkAuth(authHeader: string | undefined, expected: string): boolean {
-  if (!authHeader) return false;
-  const m = /^Bearer\s+(.+)$/i.exec(authHeader.trim());
-  if (!m) return false;
-  const a = Buffer.from(m[1]!);
-  const b = Buffer.from(expected);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+export function checkAuth(creds: ClientCredentials, expected: string): boolean {
+  const candidates: string[] = [];
+  const header = creds.authorization;
+  if (header) {
+    const m = /^Bearer\s+(.+)$/i.exec(header.trim());
+    if (m) candidates.push(m[1]!);
+  }
+  if (creds.xApiKey) candidates.push(creds.xApiKey.trim());
+  return candidates.some((candidate) => safeEqual(candidate, expected));
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
