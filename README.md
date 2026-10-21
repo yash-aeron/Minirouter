@@ -12,26 +12,29 @@ A local AI gateway/router in the spirit of [9Router](https://github.com/decolua/
 - **Usage tracking**: every request is logged to SQLite (no native build needed — uses Node's built-in `node:sqlite`); inspect with `GET /v1/usage/summary`.
 - **Security defaults**: binds `127.0.0.1`, per-install random API key (never a shipped default), all `/v1/*` routes behind auth.
 
+## Requirements
+
+Node.js 22.13 or newer. Usage tracking uses the built-in `node:sqlite`, which is unflagged from 22.13.0.
+
 ## Quick start
 
 ```bash
-npm install
-npm run build          # optional; or use npx tsx
-npx tsx src/index.ts init         # writes an example config to ~/.miniroute/config.json
-set GLM_API_KEY=...               # keys come from the environment via "env:VAR"
-npx tsx src/index.ts run
+npm install -g miniroute      # or run the same commands with: npx miniroute@latest ...
+miniroute init                # writes an example config to ~/.miniroute/config.json
+export GLM_API_KEY=...        # keys come from the environment via "env:VAR"
+miniroute run
 ```
 
 Get your key:
 
 ```bash
-npx tsx src/index.ts key
+miniroute key
 ```
 
-Check your config:
+Check your config (exits non-zero when a route is broken):
 
 ```bash
-npx tsx src/index.ts doctor
+miniroute doctor
 ```
 
 ## Configuration
@@ -69,10 +72,14 @@ API key: run `miniroute key`. Base URL: `http://127.0.0.1:4569`.
 
 **Claude Code**
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:4569
-export ANTHROPIC_API_KEY=<miniroute key>
+export ANTHROPIC_BASE_URL=http://127.0.0.1:4569   # origin only, no /v1
+export ANTHROPIC_API_KEY=<miniroute key>           # sent as x-api-key
+# or, instead of ANTHROPIC_API_KEY:
+# export ANTHROPIC_AUTH_TOKEN=<miniroute key>      # sent as Authorization: Bearer
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5  # optional: cheap model for background calls
 claude --model claude-sonnet-4-6
 ```
+Claude Code appends `/v1/messages` itself, so `ANTHROPIC_BASE_URL` must not include `/v1`.
 
 **Codex CLI**
 ```bash
@@ -81,6 +88,16 @@ export OPENAI_API_KEY=<miniroute key>
 ```
 
 **Cursor / Cline / Continue** — provider "OpenAI Compatible", base URL `http://127.0.0.1:4569/v1`, model `glm/glm-4.7` or a route alias.
+
+## Claude Code compatibility
+
+- Both credential headers are accepted: `x-api-key` (Claude Code, Anthropic SDKs) and `Authorization: Bearer`.
+- `anthropic-beta`, `anthropic-version`, and `x-claude-code-*` request headers are forwarded to native Anthropic upstreams, so beta features keep working.
+- `cache_control` markers, block-form `system` prompts, mid-conversation `system` messages, and `thinking` / `redacted_thinking` blocks survive translation. Non-Anthropic upstreams cannot use Anthropic-only fields: cache markers are dropped and reasoning blocks are not re-emitted.
+- Non-retryable upstream errors are returned with their original status and body; `retry-after`, `x-should-retry`, and `anthropic-ratelimit-*` headers are relayed. Chain exhaustion maps the last error to 429/402, otherwise 502.
+- A stream that dies after the first token ends with `event: error` for Anthropic clients, or an error chunk followed by `[DONE]` for OpenAI clients. It never looks like a clean stop, and the request is logged with `ok: false`.
+- `/v1/messages/count_tokens` is not implemented; Claude Code falls back to its local character-based estimate.
+- Idle streams receive heartbeat pings (Anthropic `event: ping`, otherwise an SSE comment). Override the interval with `MINIROUTE_HEARTBEAT_MS`.
 
 ## API
 
@@ -97,9 +114,10 @@ export OPENAI_API_KEY=<miniroute key>
 
 ```bash
 npm run dev          # tsx watch entrypoint
-npm test             # vitest: translators, router, e2e against a mock upstream
+npm test             # vitest: translators, router, auth, SSE, e2e against a mock upstream
 npm run typecheck
 npm run build        # tsup -> dist/
+npm run smoke:dist   # after build: starts the dist CLI against a mock upstream
 ```
 
 ## Roadmap (not yet built)
