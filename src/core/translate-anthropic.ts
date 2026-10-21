@@ -2,11 +2,14 @@
  * Anthropic Messages API translation: client side and provider side.
  */
 import {
+  IRCacheControl,
   IRContentBlock,
   IRFinishReason,
+  IRMessage,
   IRRequest,
   IRResponse,
   IRStreamEvent,
+  IRSystemBlock,
   IRUsage,
   randomId,
 } from './ir.js';
@@ -18,26 +21,44 @@ export function anthropicRequestToIR(body: Record<string, any>): IRRequest {
   const messages: IRRequest['messages'] = [];
 
   for (const m of body.messages ?? []) {
-    const role: 'user' | 'assistant' = m.role === 'assistant' ? 'assistant' : 'user';
+    const role: IRMessage['role'] =
+      m.role === 'assistant' ? 'assistant' : m.role === 'system' ? 'system' : 'user';
     const blocksIn = Array.isArray(m.content)
       ? m.content
       : typeof m.content === 'string'
         ? [{ type: 'text', text: m.content }]
         : [];
     const content: IRContentBlock[] = [];
-    const toolResults: Array<{ id: string; content: IRContentBlock[]; isError?: boolean }> = [];
+    const toolResults: Array<{
+      id: string;
+      content: IRContentBlock[];
+      isError?: boolean;
+      cacheControl?: IRCacheControl;
+    }> = [];
 
     for (const b of blocksIn) {
-      if (b.type === 'text') content.push({ type: 'text', text: String(b.text ?? '') });
-      else if (b.type === 'image') {
+      if (b.type === 'text') {
+        content.push({
+          type: 'text',
+          text: String(b.text ?? ''),
+          ...(b.cache_control ? { cacheControl: b.cache_control } : {}),
+        });
+      } else if (b.type === 'image') {
         if (b.source?.type === 'base64') {
           content.push({
             type: 'image',
             mediaType: String(b.source.media_type ?? ''),
             base64: String(b.source.data ?? ''),
+            ...(b.cache_control ? { cacheControl: b.cache_control } : {}),
           });
         } else if (b.source?.type === 'url') {
-          content.push({ type: 'image', mediaType: '', base64: '', url: String(b.source.url ?? '') });
+          content.push({
+            type: 'image',
+            mediaType: '',
+            base64: '',
+            url: String(b.source.url ?? ''),
+            ...(b.cache_control ? { cacheControl: b.cache_control } : {}),
+          });
         }
       } else if (b.type === 'tool_use') {
         content.push({
@@ -45,6 +66,7 @@ export function anthropicRequestToIR(body: Record<string, any>): IRRequest {
           id: String(b.id ?? randomId('toolu')),
           name: String(b.name ?? ''),
           arguments: JSON.stringify(b.input ?? {}),
+          ...(b.cache_control ? { cacheControl: b.cache_control } : {}),
         });
       } else if (b.type === 'tool_result') {
         const inner = Array.isArray(b.content)
@@ -68,30 +90,61 @@ export function anthropicRequestToIR(body: Record<string, any>): IRRequest {
           id: String(b.tool_use_id ?? ''),
           content: inner.length ? inner : [{ type: 'text', text: '' }],
           isError: Boolean(b.is_error),
+          ...(b.cache_control ? { cacheControl: b.cache_control } : {}),
         });
+      } else if (b.type === 'thinking') {
+        content.push({
+          type: 'thinking',
+          thinking: String(b.thinking ?? ''),
+          ...(b.signature ? { signature: String(b.signature) } : {}),
+        });
+      } else if (b.type === 'redacted_thinking') {
+        content.push({ type: 'redacted_thinking', data: String(b.data ?? '') });
       }
-      // thinking blocks: dropped in v1
     }
 
-    if (role === 'assistant') {
-      messages.push({ role: 'assistant', content });
+    if (role === 'assistant' || role === 'system') {
+      messages.push({ role, content });
     } else if (toolResults.length && content.length === 0) {
       for (const tr of toolResults) {
-        messages.push({ role: 'tool', toolCallId: tr.id, content: tr.content, isError: tr.isError });
+        messages.push({
+          role: 'tool',
+          toolCallId: tr.id,
+          content: tr.content,
+          isError: tr.isError,
+          ...(tr.cacheControl ? { cacheControl: tr.cacheControl } : {}),
+        });
       }
     } else {
       if (content.length) messages.push({ role: 'user', content });
       for (const tr of toolResults) {
-        messages.push({ role: 'tool', toolCallId: tr.id, content: tr.content, isError: tr.isError });
+        messages.push({
+          role: 'tool',
+          toolCallId: tr.id,
+          content: tr.content,
+          isError: tr.isError,
+          ...(tr.cacheControl ? { cacheControl: tr.cacheControl } : {}),
+        });
       }
     }
   }
 
-  const system = Array.isArray(body.system)
-    ? body.system.map((b: any) => String(b.text ?? '')).filter(Boolean).join('\n\n')
-    : typeof body.system === 'string'
-      ? body.system
-      : undefined;
+  let system: string | undefined;
+  let systemBlocks: IRSystemBlock[] | undefined;
+  if (Array.isArray(body.system)) {
+    systemBlocks = body.system.map((b: any) => ({
+      type: 'text' as const,
+      text: String(b?.text ?? ''),
+      ...(b?.cache_control ? { cacheControl: b.cache_control } : {}),
+    }));
+    const joined = systemBlocks
+      .map((b) => b.text)
+      .filter(Boolean)
+      .join('\n\n');
+    system = joined || undefined;
+  } else if (typeof body.system === 'string') {
+    system = body.system;
+  }
 
   let toolChoice: IRRequest['toolChoice'];
   switch (body.tool_choice?.type) {
@@ -111,12 +164,14 @@ export function anthropicRequestToIR(body: Record<string, any>): IRRequest {
 
   return {
     model: String(body.model ?? ''),
-    system: system || undefined,
+    system,
+    systemBlocks,
     messages,
     tools: (body.tools ?? []).map((t: any) => ({
       name: String(t.name ?? ''),
       description: t.description as string | undefined,
       parameters: t.input_schema as Record<string, unknown> | undefined,
+      ...(t.cache_control ? { cacheControl: t.cache_control } : {}),
     })),
     toolChoice,
     maxTokens: body.max_tokens,
@@ -132,7 +187,14 @@ export function anthropicRequestToIR(body: Record<string, any>): IRRequest {
 export function irToAnthropicRequest(ir: IRRequest, model: string): Record<string, unknown> {
   const messages: Array<Record<string, unknown>> = [];
 
-  const flushToolResults = (pending: Array<{ id: string; content: IRContentBlock[]; isError?: boolean }>) => {
+  const flushToolResults = (
+    pending: Array<{
+      id: string;
+      content: IRContentBlock[];
+      isError?: boolean;
+      cacheControl?: IRCacheControl;
+    }>,
+  ) => {
     if (!pending.length) return;
     messages.push({
       role: 'user',
@@ -141,15 +203,26 @@ export function irToAnthropicRequest(ir: IRRequest, model: string): Record<strin
         tool_use_id: tr.id,
         content: tr.content.map(irBlockToAnthropic),
         ...(tr.isError ? { is_error: true } : {}),
+        ...(tr.cacheControl ? { cache_control: tr.cacheControl } : {}),
       })),
     });
     pending.length = 0;
   };
 
-  let pendingTools: Array<{ id: string; content: IRContentBlock[]; isError?: boolean }> = [];
+  const pendingTools: Array<{
+    id: string;
+    content: IRContentBlock[];
+    isError?: boolean;
+    cacheControl?: IRCacheControl;
+  }> = [];
   for (const m of ir.messages) {
     if (m.role === 'tool') {
-      pendingTools.push({ id: m.toolCallId ?? '', content: m.content, isError: m.isError });
+      pendingTools.push({
+        id: m.toolCallId ?? '',
+        content: m.content,
+        isError: m.isError,
+        cacheControl: m.cacheControl,
+      });
       continue;
     }
     flushToolResults(pendingTools);
@@ -166,12 +239,21 @@ export function irToAnthropicRequest(ir: IRRequest, model: string): Record<strin
     messages,
     stream: ir.stream,
   };
-  if (ir.system) req.system = ir.system;
+  if (ir.systemBlocks?.length) {
+    req.system = ir.systemBlocks.map((b) => ({
+      type: 'text',
+      text: b.text,
+      ...(b.cacheControl ? { cache_control: b.cacheControl } : {}),
+    }));
+  } else if (ir.system) {
+    req.system = ir.system;
+  }
   if (ir.tools.length) {
     req.tools = ir.tools.map((t) => ({
       name: t.name,
       ...(t.description !== undefined ? { description: t.description } : {}),
       input_schema: t.parameters ?? { type: 'object' },
+      ...(t.cacheControl ? { cache_control: t.cacheControl } : {}),
     }));
   }
   if (ir.toolChoice) {
@@ -189,19 +271,38 @@ export function irToAnthropicRequest(ir: IRRequest, model: string): Record<strin
 }
 
 function irBlockToAnthropic(b: IRContentBlock): Record<string, unknown> {
-  if (b.type === 'text') return { type: 'text', text: b.text };
+  if (b.type === 'text') {
+    return {
+      type: 'text',
+      text: b.text,
+      ...(b.cacheControl ? { cache_control: b.cacheControl } : {}),
+    };
+  }
   if (b.type === 'image') {
-    if (b.url) return { type: 'image', source: { type: 'url', url: b.url } };
+    const cache = b.cacheControl ? { cache_control: b.cacheControl } : {};
+    if (b.url) return { type: 'image', source: { type: 'url', url: b.url }, ...cache };
     return {
       type: 'image',
       source: { type: 'base64', media_type: b.mediaType, data: b.base64 },
+      ...cache,
     };
+  }
+  if (b.type === 'thinking') {
+    return {
+      type: 'thinking',
+      thinking: b.thinking,
+      ...(b.signature ? { signature: b.signature } : {}),
+    };
+  }
+  if (b.type === 'redacted_thinking') {
+    return { type: 'redacted_thinking', data: b.data };
   }
   return {
     type: 'tool_use',
     id: b.id,
     name: b.name,
     input: safeParse(b.arguments),
+    ...(b.cacheControl ? { cache_control: b.cacheControl } : {}),
   };
 }
 
@@ -227,6 +328,14 @@ export function anthropicResponseToIR(json: Record<string, any>, model: string):
         name: String(b.name ?? ''),
         arguments: JSON.stringify(b.input ?? {}),
       });
+    } else if (b.type === 'thinking') {
+      content.push({
+        type: 'thinking',
+        thinking: String(b.thinking ?? ''),
+        ...(b.signature ? { signature: String(b.signature) } : {}),
+      });
+    } else if (b.type === 'redacted_thinking') {
+      content.push({ type: 'redacted_thinking', data: String(b.data ?? '') });
     }
   }
   return {
@@ -284,12 +393,18 @@ export async function* anthropicSSEToIREvents(
             id: String(ev.content_block.id ?? ''),
             name: String(ev.content_block.name ?? ''),
           };
+        } else if (ev.content_block?.type === 'redacted_thinking') {
+          yield { type: 'redacted_thinking', data: String(ev.content_block.data ?? '') };
         }
         break;
       case 'content_block_delta': {
         const d = ev.delta;
         if (d?.type === 'text_delta') yield { type: 'text_delta', text: String(d.text ?? '') };
-        else if (d?.type === 'input_json_delta') {
+        else if (d?.type === 'thinking_delta') {
+          yield { type: 'thinking_delta', text: String(d.thinking ?? '') };
+        } else if (d?.type === 'signature_delta') {
+          yield { type: 'signature_delta', signature: String(d.signature ?? '') };
+        } else if (d?.type === 'input_json_delta') {
           yield { type: 'tool_call_delta', id: '', argumentsDelta: String(d.partial_json ?? '') };
         }
         break;
@@ -304,13 +419,20 @@ export async function* anthropicSSEToIREvents(
         break;
       case 'error':
         finished = true;
-        yield { type: 'finish', reason: 'error' };
+        yield { type: 'error', message: describeAnthropicError(ev) };
         return;
       case 'message_stop':
         return;
     }
   }
   if (!finished) yield { type: 'finish', reason: 'stop' };
+}
+
+function describeAnthropicError(ev: Record<string, any>): string {
+  const e = ev.error ?? {};
+  const type = typeof e.type === 'string' ? e.type : 'api_error';
+  const message = typeof e.message === 'string' ? e.message : 'upstream stream error';
+  return `${type}: ${message}`;
 }
 
 /* ---------------------------- IR -> client response ---------------------------- */
@@ -353,6 +475,13 @@ function irUsageToAnthropic(u: IRUsage): Record<string, unknown> {
 
 /* ---------------------------- IR events -> client SSE ---------------------------- */
 
+export function anthropicStreamError(message: string): string {
+  return sseFormat(
+    JSON.stringify({ type: 'error', error: { type: 'api_error', message } }),
+    'error',
+  );
+}
+
 export async function* irEventsToAnthropicSSE(
   events: AsyncIterable<IRStreamEvent>,
   model: string,
@@ -360,7 +489,7 @@ export async function* irEventsToAnthropicSSE(
   const id = randomId('msg');
   let started = false;
   let blockIndex = -1;
-  let openBlock: 'text' | 'tool_use' | null = null;
+  let openBlock: 'text' | 'tool_use' | 'thinking' | null = null;
   let usage: IRUsage = {};
 
   const startMessage = () => {
@@ -409,6 +538,19 @@ export async function* irEventsToAnthropicSSE(
     );
   };
 
+  const openThinkingBlock = () => {
+    blockIndex += 1;
+    openBlock = 'thinking';
+    return sseFormat(
+      JSON.stringify({
+        type: 'content_block_start',
+        index: blockIndex,
+        content_block: { type: 'thinking', thinking: '', signature: '' },
+      }),
+      'content_block_start',
+    );
+  };
+
   const closeBlock = () =>
     openBlock === null
       ? ''
@@ -438,6 +580,54 @@ export async function* irEventsToAnthropicSSE(
           ),
         );
         break;
+      case 'thinking_delta':
+        if (openBlock !== 'thinking') {
+          emit(closeBlock());
+          emit(openThinkingBlock());
+        }
+        emit(
+          sseFormat(
+            JSON.stringify({
+              type: 'content_block_delta',
+              index: blockIndex,
+              delta: { type: 'thinking_delta', thinking: ev.text },
+            }),
+            'content_block_delta',
+          ),
+        );
+        break;
+      case 'signature_delta':
+        if (openBlock !== 'thinking') {
+          emit(closeBlock());
+          emit(openThinkingBlock());
+        }
+        emit(
+          sseFormat(
+            JSON.stringify({
+              type: 'content_block_delta',
+              index: blockIndex,
+              delta: { type: 'signature_delta', signature: ev.signature },
+            }),
+            'content_block_delta',
+          ),
+        );
+        break;
+      case 'redacted_thinking':
+        emit(closeBlock());
+        blockIndex += 1;
+        emit(
+          sseFormat(
+            JSON.stringify({
+              type: 'content_block_start',
+              index: blockIndex,
+              content_block: { type: 'redacted_thinking', data: ev.data },
+            }),
+            'content_block_start',
+          ),
+        );
+        emit(sseFormat(JSON.stringify({ type: 'content_block_stop', index: blockIndex }), 'content_block_stop'));
+        openBlock = null;
+        break;
       case 'tool_call_start':
         emit(closeBlock());
         emit(openToolBlock(ev.id, ev.name));
@@ -458,9 +648,20 @@ export async function* irEventsToAnthropicSSE(
       case 'usage':
         usage = { ...usage, ...ev.usage };
         break;
+      case 'error':
+        emit(closeBlock());
+        openBlock = null;
+        emit(anthropicStreamError(ev.message));
+        yield out;
+        return;
       case 'finish': {
         emit(closeBlock());
         openBlock = null;
+        if (ev.reason === 'error') {
+          emit(anthropicStreamError('upstream stream ended with an error'));
+          yield out;
+          return;
+        }
         emit(
           sseFormat(
             JSON.stringify({
@@ -481,20 +682,10 @@ export async function* irEventsToAnthropicSSE(
       out = '';
     }
   }
-  // Stream ended without finish: close politely.
-  if (started) {
-    emit(closeBlock());
-    emit(
-      sseFormat(
-        JSON.stringify({
-          type: 'message_delta',
-          delta: { stop_reason: 'end_turn', stop_sequence: null },
-          usage: { output_tokens: usage.outputTokens ?? 0 },
-        }),
-        'message_delta',
-      ),
-    );
-    emit(sseFormat(JSON.stringify({ type: 'message_stop' }), 'message_stop'));
-    yield out;
-  }
+  // Stream ended without a finish event: that is a truncated answer, not a success.
+  if (!started) emit(startMessage());
+  emit(closeBlock());
+  openBlock = null;
+  emit(anthropicStreamError('upstream stream ended without a finish event'));
+  yield out;
 }

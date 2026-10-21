@@ -172,6 +172,10 @@ export async function* geminiSSEToIREvents(
     } catch {
       continue;
     }
+    if (json.error) {
+      yield { type: 'error', message: describeGeminiError(json.error) };
+      return;
+    }
     const cand = json.candidates?.[0];
     for (const part of cand?.content?.parts ?? []) {
       if (typeof part.text === 'string' && part.text !== '') {
@@ -200,4 +204,10 @@ export async function* geminiSSEToIREvents(
     }
   }
   yield { type: 'finish', reason: 'stop' };
+}
+
+function describeGeminiError(error: Record<string, any>): string {
+  const status = typeof error.status === 'string' ? error.status : 'error';
+  const message = typeof error.message === 'string' ? error.message : 'upstream stream error';
+  return `${status}: ${message}`;
 }

@@ -18,30 +18,47 @@ export interface IRUsage {
   cacheWriteTokens?: number;
 }
 
+/** Anthropic `cache_control` marker, passed through verbatim when the target supports it. */
+export type IRCacheControl = Record<string, unknown>;
+
+export interface IRSystemBlock {
+  type: 'text';
+  text: string;
+  cacheControl?: IRCacheControl;
+}
+
 export type IRContentBlock =
-  | { type: 'text'; text: string }
-  | { type: 'image'; mediaType: string; base64: string; url?: string }
-  | { type: 'tool_call'; id: string; name: string; arguments: string };
+  | { type: 'text'; text: string; cacheControl?: IRCacheControl }
+  | { type: 'image'; mediaType: string; base64: string; url?: string; cacheControl?: IRCacheControl }
+  | { type: 'tool_call'; id: string; name: string; arguments: string; cacheControl?: IRCacheControl }
+  | { type: 'thinking'; thinking: string; signature?: string }
+  | { type: 'redacted_thinking'; data: string };
 
 export interface IRMessage {
-  role: 'user' | 'assistant' | 'tool';
+  role: 'user' | 'assistant' | 'tool' | 'system';
   content: IRContentBlock[];
   /** only for role === 'tool' */
   toolCallId?: string;
   /** Anthropic tool_result is_error flag, kept for fidelity */
   isError?: boolean;
+  /** Anthropic tool_result cache marker */
+  cacheControl?: IRCacheControl;
 }
 
 export interface IRTool {
   name: string;
   description?: string;
   parameters?: Record<string, unknown>;
+  cacheControl?: IRCacheControl;
 }
 
 export interface IRRequest {
   /** model name as the client asked for it (alias or provider-prefixed) */
   model: string;
+  /** flattened system prompt, used by providers that take a single string */
   system?: string;
+  /** original block-form system prompt (Anthropic cache markers, stable order) */
+  systemBlocks?: IRSystemBlock[];
   messages: IRMessage[];
   tools: IRTool[];
   toolChoice?: { type: 'auto' | 'none' | 'required' } | { type: 'tool'; name: string };
@@ -50,6 +67,8 @@ export interface IRRequest {
   topP?: number;
   stopSequences?: string[];
   stream: boolean;
+  /** client headers to forward upstream (anthropic-*, x-claude-code-*), lowercased */
+  clientHeaders?: Record<string, string>;
 }
 
 export interface IRResponse {
@@ -62,10 +81,14 @@ export interface IRResponse {
 /** Normalized stream events. Translators serialize these into each wire format. */
 export type IRStreamEvent =
   | { type: 'text_delta'; text: string }
+  | { type: 'thinking_delta'; text: string }
+  | { type: 'signature_delta'; signature: string }
+  | { type: 'redacted_thinking'; data: string }
   | { type: 'tool_call_start'; id: string; name: string }
   | { type: 'tool_call_delta'; id: string; argumentsDelta: string }
   | { type: 'usage'; usage: IRUsage }
-  | { type: 'finish'; reason: IRFinishReason };
+  | { type: 'finish'; reason: IRFinishReason }
+  | { type: 'error'; message: string; retryable?: boolean };
 
 export function textBlock(text: string): IRContentBlock {
   return { type: 'text', text };

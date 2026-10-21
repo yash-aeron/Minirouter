@@ -16,6 +16,7 @@ import {
   irEventsToAnthropicSSE,
 } from '../src/core/translate-anthropic.js';
 import { responsesRequestToIR, irToResponsesResponse, irEventsToResponsesSSE } from '../src/core/translate-responses.js';
+import { geminiResponseToIR, geminiSSEToIREvents, irToGeminiRequest } from '../src/core/translate-gemini.js';
 import { IRRequest, IRStreamEvent } from '../src/core/ir.js';
 import { sseFormat } from '../src/core/sse.js';
 
@@ -121,6 +122,43 @@ describe('OpenAI chat translator', () => {
     const finishChunk = parsed.find((p) => p.choices[0]?.finish_reason);
     expect(finishChunk.choices[0].finish_reason).toBe('tool_calls');
   });
+
+  it('drops thinking blocks and folds mid-conversation system messages into user turns', () => {
+    const ir: IRRequest = {
+      model: 'm',
+      system: 'sys',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'secret reasoning', signature: 's' },
+            { type: 'text', text: 'visible' },
+          ],
+        },
+        { role: 'system', content: [{ type: 'text', text: 'mid' }] },
+      ],
+      tools: [],
+      stream: false,
+    };
+    const wire = irToOpenAIChatRequest(ir, 'm') as any;
+    expect(wire.messages[2].content).toBe('visible');
+    expect(JSON.stringify(wire)).not.toContain('secret reasoning');
+    expect(wire.messages[3]).toEqual({ role: 'user', content: 'mid' });
+  });
+
+  it('emits an error chunk and [DONE] when the IR stream errors', async () => {
+    const events: IRStreamEvent[] = [
+      { type: 'text_delta', text: 'partial' },
+      { type: 'error', message: 'server_error: exploded' },
+    ];
+    const out: string[] = [];
+    for await (const s of irEventsToOpenAISSE(events[Symbol.iterator]() as any, 'm', true)) out.push(s);
+    const joined = out.join('');
+    expect(joined).toContain('"error"');
+    expect(joined).toContain('server_error: exploded');
+    expect(joined.trimEnd().endsWith('[DONE]')).toBe(true);
+  });
 });
 
 describe('Anthropic translator', () => {
@@ -193,6 +231,116 @@ describe('Anthropic translator', () => {
     expect(joined).toContain('"stop_reason":"end_turn"');
     expect(joined).toContain('message_stop');
   });
+
+  it('round-trips block system prompts, cache_control, and mid-conversation system messages', () => {
+    const body = {
+      model: 'claude-x',
+      max_tokens: 10,
+      system: [
+        { type: 'text', text: 'stable prefix', cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: 'dynamic' },
+      ],
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+        },
+        { role: 'assistant', content: [{ type: 'text', text: 'hello' }] },
+        { role: 'system', content: [{ type: 'text', text: 'mid' }] },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 't1', content: 'ok', cache_control: { type: 'ephemeral' } },
+          ],
+        },
+      ],
+      tools: [{ name: 'f', input_schema: { type: 'object' }, cache_control: { type: 'ephemeral' } }],
+    };
+    const ir = anthropicRequestToIR(body);
+    expect(ir.system).toBe('stable prefix\n\ndynamic');
+    expect(ir.systemBlocks).toEqual([
+      { type: 'text', text: 'stable prefix', cacheControl: { type: 'ephemeral' } },
+      { type: 'text', text: 'dynamic' },
+    ]);
+
+    const wire = irToAnthropicRequest(ir, 'claude-x') as any;
+    expect(wire.system).toEqual(body.system);
+    expect(wire.messages[0].content[0].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+    expect(wire.messages[2]).toEqual({ role: 'system', content: [{ type: 'text', text: 'mid' }] });
+    expect(wire.messages[3].content[0].cache_control).toEqual({ type: 'ephemeral' });
+    expect(wire.tools[0].cache_control).toEqual({ type: 'ephemeral' });
+
+    // The same IR sent to an OpenAI-compatible provider must not leak
+    // Anthropic-only cache markers, and system blocks collapse to one string.
+    const openaiWire = irToOpenAIChatRequest(ir, 'glm-4.7') as any;
+    expect(openaiWire.messages[0]).toEqual({ role: 'system', content: 'stable prefix\n\ndynamic' });
+    expect(JSON.stringify(openaiWire)).not.toContain('cache_control');
+  });
+
+  it('round-trips thinking and redacted_thinking blocks', () => {
+    const upstream = {
+      content: [
+        { type: 'thinking', thinking: 'let me think', signature: 'sig-1' },
+        { type: 'redacted_thinking', data: 'opaque' },
+        { type: 'text', text: 'answer' },
+      ],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+    const ir = anthropicResponseToIR(upstream, 'claude-x');
+    expect(ir.content[0]).toEqual({ type: 'thinking', thinking: 'let me think', signature: 'sig-1' });
+
+    const client = irToAnthropicResponse(ir) as any;
+    expect(client.content[0]).toEqual({ type: 'thinking', thinking: 'let me think', signature: 'sig-1' });
+    expect(client.content[1]).toEqual({ type: 'redacted_thinking', data: 'opaque' });
+
+    // The client echoes the assistant turn back on the next request.
+    const echoed = anthropicRequestToIR({
+      model: 'm',
+      max_tokens: 1,
+      messages: [{ role: 'assistant', content: upstream.content }],
+    });
+    expect(echoed.messages[0]!.content[0]).toMatchObject({ type: 'thinking', signature: 'sig-1' });
+    expect(echoed.messages[0]!.content[1]).toEqual({ type: 'redacted_thinking', data: 'opaque' });
+  });
+
+  it('streams thinking deltas as anthropic thinking blocks', async () => {
+    const events: IRStreamEvent[] = [
+      { type: 'thinking_delta', text: 'hmm' },
+      { type: 'signature_delta', signature: 'sig' },
+      { type: 'text_delta', text: 'answer' },
+      { type: 'finish', reason: 'stop' },
+    ];
+    const out: string[] = [];
+    for await (const s of irEventsToAnthropicSSE(events[Symbol.iterator]() as any, 'm')) out.push(s);
+    const joined = out.join('');
+    expect(joined).toContain('"type":"thinking"');
+    expect(joined).toContain('"thinking_delta"');
+    expect(joined).toContain('"signature_delta"');
+    expect(joined).toContain('"text_delta"');
+    expect(joined.indexOf('signature_delta')).toBeLessThan(joined.indexOf('text_delta'));
+
+    // Non-Anthropic clients never see reasoning text.
+    const openaiOut: string[] = [];
+    for await (const s of irEventsToOpenAISSE(events[Symbol.iterator]() as any, 'm', false)) openaiOut.push(s);
+    const openaiJoined = openaiOut.join('');
+    expect(openaiJoined).toContain('answer');
+    expect(openaiJoined).not.toContain('hmm');
+    expect(openaiJoined).not.toContain('sig');
+  });
+
+  it('emits an error event and no message_stop when the upstream stream errors', async () => {
+    const events: IRStreamEvent[] = [
+      { type: 'text_delta', text: 'partial' },
+      { type: 'error', message: 'overloaded_error: busy' },
+    ];
+    const out: string[] = [];
+    for await (const s of irEventsToAnthropicSSE(events[Symbol.iterator]() as any, 'm')) out.push(s);
+    const joined = out.join('');
+    expect(joined).toContain('event: error');
+    expect(joined).toContain('overloaded_error: busy');
+    expect(joined).not.toContain('message_stop');
+  });
 });
 
 describe('Responses translator', () => {
@@ -242,5 +390,72 @@ describe('Responses translator', () => {
     expect(types.at(-1)).toBe('response.completed');
     const completed = JSON.parse(out.at(-1)!.trim().replace(/^event: [\w.]+\ndata: /, '').trim());
     expect(completed.response.output[0].content[0].text).toBe('hello');
+  });
+});
+
+describe('Gemini translator', () => {
+  it('serializes IR with system, tools, and tool results without leaking anthropic-only fields', () => {
+    const wire = irToGeminiRequest(baseIR) as any;
+    expect(wire.systemInstruction.parts[0].text).toBe('you are helpful');
+    expect(wire.contents[0]).toEqual({ role: 'user', parts: [{ text: 'hi' }] });
+    expect(wire.contents[1].parts[0].functionCall.name).toBe('get_weather');
+    expect(wire.contents[2].parts[0].functionResponse.name).toBe('get_weather');
+    expect(wire.tools[0].functionDeclarations[0].name).toBe('get_weather');
+    expect(JSON.stringify(wire)).not.toContain('cache_control');
+  });
+
+  it('parses a response and maps finish/usage', () => {
+    const irResp = geminiResponseToIR(
+      {
+        candidates: [{ content: { parts: [{ text: 'hi there' }] }, finishReason: 'MAX_TOKENS' }],
+        usageMetadata: { promptTokenCount: 3, candidatesTokenCount: 2 },
+      },
+      'g',
+    );
+    expect(irResp.content).toEqual([{ type: 'text', text: 'hi there' }]);
+    expect(irResp.finish).toBe('length');
+    expect(irResp.usage.inputTokens).toBe(3);
+    expect(irResp.usage.outputTokens).toBe(2);
+  });
+
+  it('parses streaming candidates and surfaces error payloads', async () => {
+    async function* body() {
+      const enc = new TextEncoder();
+      yield enc.encode(
+        sseFormat(
+          JSON.stringify({
+            candidates: [{ content: { parts: [{ text: 'a' }] } }],
+            usageMetadata: { promptTokenCount: 1 },
+          }),
+        ),
+      );
+      yield enc.encode(
+        sseFormat(
+          JSON.stringify({
+            candidates: [{ content: { parts: [{ text: 'b' }] }, finishReason: 'STOP' }],
+            usageMetadata: { candidatesTokenCount: 2 },
+          }),
+        ),
+      );
+    }
+    const events: IRStreamEvent[] = [];
+    for await (const ev of geminiSSEToIREvents(body())) events.push(ev);
+    expect(
+      events.filter((e) => e.type === 'text_delta').map((e) => (e as { text: string }).text),
+    ).toEqual(['a', 'b']);
+    expect(events.at(-1)).toEqual({ type: 'finish', reason: 'stop' });
+
+    async function* errBody() {
+      yield new TextEncoder().encode(
+        sseFormat(
+          JSON.stringify({
+            error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'quota exceeded' },
+          }),
+        ),
+      );
+    }
+    const errEvents: IRStreamEvent[] = [];
+    for await (const ev of geminiSSEToIREvents(errBody())) errEvents.push(ev);
+    expect(errEvents).toEqual([{ type: 'error', message: 'RESOURCE_EXHAUSTED: quota exceeded' }]);
   });
 });

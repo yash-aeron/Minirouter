@@ -251,6 +251,15 @@ export async function* irEventsToResponsesSSE(
       case 'usage':
         usage = { ...usage, ...e.usage };
         break;
+      case 'error': {
+        yield ev('response.failed', {
+          response: {
+            ...base('failed'),
+            error: { code: 'upstream_error', message: e.message },
+          },
+        });
+        return;
+      }
       case 'finish': {
         if (openKind === 'message') {
           const item = {
@@ -286,6 +295,15 @@ export async function* irEventsToResponsesSSE(
           finalItems.push({ type: 'function_call', item });
         }
         openKind = null;
+        if (e.reason === 'error') {
+          yield ev('response.failed', {
+            response: {
+              ...base('failed'),
+              error: { code: 'upstream_error', message: 'upstream stream ended with an error' },
+            },
+          });
+          return;
+        }
         yield ev('response.completed', { response: base('completed') });
         return;
       }
@@ -294,7 +312,12 @@ export async function* irEventsToResponsesSSE(
   if (!created) {
     yield ev('response.created', { response: base('in_progress') });
   }
-  yield ev('response.completed', { response: base('completed') });
+  yield ev('response.failed', {
+    response: {
+      ...base('failed'),
+      error: { code: 'upstream_error', message: 'upstream stream ended without a finish event' },
+    },
+  });
 }
 
 function responsesUsage(u: IRUsage): Record<string, number> {

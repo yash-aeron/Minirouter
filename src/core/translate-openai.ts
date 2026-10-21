@@ -265,6 +265,10 @@ export async function* openaiSSEToIREvents(
     } catch {
       continue;
     }
+    if (chunk.error) {
+      yield { type: 'error', message: describeOpenAIError(chunk.error) };
+      return;
+    }
     const choice = chunk.choices?.[0];
     const delta = choice?.delta;
     if (delta?.content !== undefined && delta.content !== null && delta.content !== '') {
@@ -289,6 +293,13 @@ export async function* openaiSSEToIREvents(
   }
   // Stream ended without a finish_reason: treat as clean stop.
   yield { type: 'finish', reason: 'stop' };
+}
+
+function describeOpenAIError(error: Record<string, any> | string): string {
+  if (typeof error === 'string') return error;
+  const type = typeof error.type === 'string' ? error.type : 'api_error';
+  const message = typeof error.message === 'string' ? error.message : 'upstream stream error';
+  return `${type}: ${message}`;
 }
 
 /* ---------------------------- IR -> client response ---------------------------- */
@@ -364,20 +375,23 @@ export async function* irEventsToOpenAISSE(
     });
 
   let sentRole = false;
+  const ensureRole = (): string[] => {
+    if (sentRole) return [];
+    sentRole = true;
+    return [sseFormat(chunk({ role: 'assistant', content: '' }))];
+  };
   const idToIndex = new Map<string, number>();
   let nextIndex = 0;
   let usage: IRUsage | undefined;
 
   for await (const ev of events) {
-    if (!sentRole) {
-      sentRole = true;
-      yield sseFormat(chunk({ role: 'assistant', content: '' }));
-    }
     switch (ev.type) {
       case 'text_delta':
+        yield* ensureRole();
         yield sseFormat(chunk({ content: ev.text }));
         break;
       case 'tool_call_start': {
+        yield* ensureRole();
         const index = nextIndex++;
         idToIndex.set(ev.id, index);
         yield sseFormat(
@@ -406,7 +420,22 @@ export async function* irEventsToOpenAISSE(
       case 'usage':
         if (ev.usage && Object.keys(ev.usage).length) usage = { ...usage, ...ev.usage };
         break;
+      case 'error':
+        yield* ensureRole();
+        yield sseFormat(JSON.stringify({ error: { message: ev.message, type: 'api_error', code: null } }));
+        yield sseFormat('[DONE]');
+        return;
       case 'finish': {
+        yield* ensureRole();
+        if (ev.reason === 'error') {
+          yield sseFormat(
+            JSON.stringify({
+              error: { message: 'upstream stream ended with an error', type: 'api_error', code: null },
+            }),
+          );
+          yield sseFormat('[DONE]');
+          return;
+        }
         yield sseFormat(chunk({}, mapIRFinishToOpenAI(ev.reason)));
         if (includeUsage) {
           yield sseFormat(
@@ -429,7 +458,12 @@ export async function* irEventsToOpenAISSE(
       }
     }
   }
-  // No finish event: close politely.
-  yield sseFormat(chunk({}, 'stop'));
+  // No finish event: the answer is truncated, so report it as an error rather than a stop.
+  yield* ensureRole();
+  yield sseFormat(
+    JSON.stringify({
+      error: { message: 'upstream stream ended without a finish event', type: 'api_error', code: null },
+    }),
+  );
   yield sseFormat('[DONE]');
 }
