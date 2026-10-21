@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { defaultConfigPath, defaultDataDir, loadConfig } from './config.js';
 import { ensureApiKey } from './auth.js';
 import { runServer } from './server.js';
+import { ChainResolver } from './router/chain.js';
 
 const EXAMPLE_CONFIG = {
   port: 4569,
@@ -71,10 +72,27 @@ program
       const { config, warnings } = loadConfig(opts.config);
       console.log(`config OK: ${opts.config}`);
       console.log(`providers: ${config.providers.map((p) => `${p.name}(${p.type})`).join(', ')}`);
-      const routeCount = Object.keys(config.routes ?? {}).length;
-      console.log(`routes: ${routeCount}`);
+      const resolver = new ChainResolver(config);
+      const routes = Object.entries(config.routes ?? {});
+      console.log(`routes: ${routes.length}`);
+      const problems: string[] = [];
+      for (const [alias] of routes) {
+        const routeWarnings: string[] = [];
+        try {
+          const candidates = resolver.resolve(alias, routeWarnings);
+          console.log(`  ${alias} -> ${candidates.map((c) => `${c.provider}/${c.model}`).join(' | ')}`);
+        } catch (err) {
+          problems.push(`${alias}: ${err instanceof Error ? err.message : err}`);
+        }
+        for (const w of routeWarnings) problems.push(`${alias}: ${w}`);
+      }
       for (const w of warnings) console.warn(`warning: ${w}`);
-      if (warnings.length === 0) console.log('no warnings');
+      for (const p of problems) console.error(`problem: ${p}`);
+      if (problems.length) {
+        process.exitCode = 1;
+      } else {
+        console.log('no route problems');
+      }
     } catch (err) {
       console.error(`FAILED: ${err instanceof Error ? err.message : err}`);
       process.exitCode = 1;
