@@ -9,10 +9,23 @@ export interface Candidate {
 export class ChainResolver {
   constructor(private readonly config: AppConfig) {}
 
-  /** Returns candidates for a model name. Throws if nothing can serve it. */
-  resolve(requestedModel: string): Candidate[] {
+  /**
+   * Returns candidates for a model name. Throws if nothing can serve it.
+   * Entries that cannot be used are reported through `warnings` rather than
+   * being dropped silently, so a typo cannot quietly shorten a fallback chain.
+   */
+  resolve(requestedModel: string, warnings: string[] = []): Candidate[] {
     const chain = this.config.routes?.[requestedModel];
-    if (chain?.length) return this.expand(chain);
+    if (chain?.length) {
+      const candidates = this.expand(chain, warnings);
+      if (!candidates.length) {
+        throw new Error(
+          `route "${requestedModel}" resolves to no usable candidates` +
+            (warnings.length ? `: ${warnings.join('; ')}` : ''),
+        );
+      }
+      return candidates;
+    }
 
     const prefixed = this.parsePrefixed(requestedModel);
     if (prefixed) {
@@ -20,6 +33,9 @@ export class ChainResolver {
       if (this.config.providers.some((p) => p.name === providerName)) {
         return [{ provider: providerName, model: rest }];
       }
+      warnings.push(
+        `model "${requestedModel}" is provider-prefixed but provider "${providerName}" is not configured`,
+      );
     }
 
     // Unprefixed: any provider whose allowlist contains the model, in config order.
@@ -36,18 +52,20 @@ export class ChainResolver {
     );
   }
 
-  private expand(chain: string[]): Candidate[] {
+  private expand(chain: string[], warnings: string[]): Candidate[] {
     const out: Candidate[] = [];
     for (const entry of chain) {
       const prefixed = this.parsePrefixed(entry);
       if (!prefixed) {
-        // route entry referencing another route is not supported; ignore
+        warnings.push(`route entry "${entry}" is not provider-prefixed and was ignored`);
         continue;
       }
       const [providerName, model] = prefixed;
-      if (this.config.providers.some((p) => p.name === providerName)) {
-        out.push({ provider: providerName, model });
+      if (!this.config.providers.some((p) => p.name === providerName)) {
+        warnings.push(`route entry "${entry}" references unknown provider "${providerName}" and was ignored`);
+        continue;
       }
+      out.push({ provider: providerName, model });
     }
     return out;
   }

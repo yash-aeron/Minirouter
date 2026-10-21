@@ -30,6 +30,7 @@ export class NoCandidateError extends Error {
   constructor(
     message: string,
     readonly attempts: AttemptRecord[],
+    readonly lastError?: ProviderError,
   ) {
     super(message);
     this.name = 'NoCandidateError';
@@ -63,15 +64,10 @@ export async function executeWithFailover(
 
     try {
       if (ir.stream) {
-        const { events, sawFirstEvent } = await peekFirstEvent(adapter, cand, ir);
-        if (sawFirstEvent && events) {
-          breakers.recordSuccess(cand.provider);
-          attempts.push({ provider: cand.provider, model: cand.model, ok: true });
-          return { events, provider: cand.provider, model: cand.model, attempts };
-        }
-        // Provider accepted the request but produced no events before failing;
-        // the generator already threw into `result.error` handling below.
-        continue;
+        const { events } = await peekFirstEvent(adapter, cand, ir);
+        breakers.recordSuccess(cand.provider);
+        attempts.push({ provider: cand.provider, model: cand.model, ok: true });
+        return { events, provider: cand.provider, model: cand.model, attempts };
       }
 
       const result = await adapter.send(ir, cand.model);
@@ -102,7 +98,9 @@ export async function executeWithFailover(
       breakers.recordFailure(cand.provider, pe);
       lastError = pe;
       if (!pe.retryable) {
-        throw new NoCandidateError(pe.message, attempts);
+        // Request-shape problems will fail everywhere: surface the original
+        // status and body instead of pretending this was a gateway failure.
+        throw pe;
       }
     }
   }
@@ -112,6 +110,7 @@ export async function executeWithFailover(
       ? `all ${attempts.length} candidate(s) failed; last error: ${lastError.message}`
       : `no usable candidate in chain of ${attempts.length}`,
     attempts,
+    lastError,
   );
 }
 
@@ -125,27 +124,69 @@ async function peekFirstEvent(
   adapter: ProviderAdapter,
   cand: Candidate,
   ir: IRRequest,
-): Promise<{ events?: AsyncIterable<IRStreamEvent>; sawFirstEvent: boolean }> {
+): Promise<{ events: AsyncIterable<IRStreamEvent> }> {
   const result = await adapter.send(ir, cand.model);
   const iterator = result.events?.[Symbol.asyncIterator]();
-  if (!iterator) return { sawFirstEvent: false };
+  if (!iterator) {
+    throw new ProviderError(`${cand.provider}: streaming request returned no event stream`, {
+      status: 502,
+      retryable: true,
+      provider: cand.provider,
+    });
+  }
   const iter = iterator;
 
-  // Promise.race wrapper: first event vs stream error.
-  const first = await iter.next();
-  if (first.done) return { sawFirstEvent: false };
-  if (first.value.type === 'finish' && first.value.reason === 'error') {
-    return { sawFirstEvent: false };
+  let first: IteratorResult<IRStreamEvent>;
+  try {
+    first = await iter.next();
+  } catch (err) {
+    await closeQuietly(iter);
+    throw err;
+  }
+
+  if (first.done) {
+    await closeQuietly(iter);
+    throw new ProviderError(`${cand.provider}: upstream stream ended before any event`, {
+      status: 502,
+      retryable: true,
+      provider: cand.provider,
+    });
+  }
+
+  const firstEvent = first.value;
+  if (firstEvent.type === 'error') {
+    await closeQuietly(iter);
+    throw new ProviderError(`${cand.provider}: ${firstEvent.message}`, {
+      status: 502,
+      retryable: firstEvent.retryable ?? true,
+      provider: cand.provider,
+    });
+  }
+  if (firstEvent.type === 'finish' && firstEvent.reason === 'error') {
+    await closeQuietly(iter);
+    throw new ProviderError(`${cand.provider}: upstream stream ended with an error`, {
+      status: 502,
+      retryable: true,
+      provider: cand.provider,
+    });
   }
 
   // Re-synthesize an iterator that yields the consumed event first.
   async function* replay(): AsyncGenerator<IRStreamEvent> {
-    yield first.value;
+    yield firstEvent;
     while (true) {
       const { value, done } = await iter.next();
       if (done) return;
       yield value;
     }
   }
-  return { events: replay(), sawFirstEvent: true };
+  return { events: replay() };
+}
+
+async function closeQuietly(iter: AsyncIterator<IRStreamEvent>): Promise<void> {
+  try {
+    await iter.return?.(undefined);
+  } catch {
+    // the upstream stream is already broken; nothing useful to do
+  }
 }

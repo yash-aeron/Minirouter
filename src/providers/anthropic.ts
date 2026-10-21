@@ -30,11 +30,15 @@ export class AnthropicAdapter implements ProviderAdapter {
   async send(ir: IRRequest, model: string): Promise<ProviderSendResult> {
     const url = `${this.baseUrl}/v1/messages`;
     const wire = irToAnthropicRequest(ir, model);
+    // Forward the client's anthropic-* headers verbatim: beta capabilities are
+    // paired with body fields, and stripping them silently disables features.
+    const passthrough = ir.clientHeaders ?? {};
     const res = await upstreamRequest(this.name, url, {
       headers: {
         'content-type': 'application/json',
         'x-api-key': this.apiKey,
-        'anthropic-version': '2023-06-01',
+        'anthropic-version': passthrough['anthropic-version'] ?? '2023-06-01',
+        ...passthrough,
         ...this.extraHeaders,
       },
       body: JSON.stringify(wire),

@@ -1,8 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Breakers } from '../src/router/breaker.js';
 import { ChainResolver } from '../src/router/chain.js';
-import { executeWithFailover } from '../src/router/failover.js';
-import { ProviderAdapter, ProviderError } from '../src/providers/types.js';
+import { executeWithFailover, NoCandidateError } from '../src/router/failover.js';
+import { ProviderAdapter, ProviderError, classifyUpstreamError } from '../src/providers/types.js';
 import { IRRequest, IRResponse, IRStreamEvent } from '../src/core/ir.js';
 import { AppConfig } from '../src/config.js';
 
@@ -76,6 +76,29 @@ describe('ChainResolver', () => {
 
   it('lists prefixed models and aliases', () => {
     expect(resolver.listModels().sort()).toEqual(['ds/ds-chat', 'ds/glm-4.7', 'glm/glm-4.7', 'my-model']);
+  });
+
+  it('reports unusable route entries instead of dropping them silently', () => {
+    const warned = new ChainResolver({
+      providers: [{ name: 'glm', type: 'openai-compat' as const }],
+      routes: { broken: ['glm/ok', 'unprefixed', 'ghost/model', 'glm/second'] },
+    });
+    const warnings: string[] = [];
+    expect(warned.resolve('broken', warnings)).toEqual([
+      { provider: 'glm', model: 'ok' },
+      { provider: 'glm', model: 'second' },
+    ]);
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toMatch(/not provider-prefixed/);
+    expect(warnings[1]).toMatch(/unknown provider "ghost"/);
+  });
+
+  it('throws when a configured route expands to zero candidates', () => {
+    const broken = new ChainResolver({
+      providers: [{ name: 'glm', type: 'openai-compat' as const }],
+      routes: { empty: ['ghost/m1'] },
+    });
+    expect(() => broken.resolve('empty')).toThrow(/resolves to no usable candidates/);
   });
 });
 
@@ -194,5 +217,144 @@ describe('executeWithFailover', () => {
     for await (const ev of result.events!) events.push(ev);
     expect(events[0]).toEqual({ type: 'text_delta', text: 'hey' });
     expect(result.provider).toBe('b');
+  });
+
+  it('rethrows non-retryable provider errors with their original status and body', async () => {
+    const a = makeAdapter(() => {
+      throw new ProviderError('bad prompt', {
+        status: 400,
+        retryable: false,
+        provider: 'a',
+        rawBody: '{"error":{"message":"too long"}}',
+      });
+    });
+    const b = makeAdapter(() => okResponse());
+    const err = await executeWithFailover(
+      ir,
+      [{ provider: 'a', model: 'm' }, { provider: 'b', model: 'm' }],
+      new Map([['a', a], ['b', b]]),
+      new Breakers(),
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ProviderError);
+    expect((err as ProviderError).status).toBe(400);
+    expect((err as ProviderError).rawBody).toContain('too long');
+  });
+
+  it('fails over when the first stream event is an error and closes the dead iterator', async () => {
+    const returned = vi.fn(async () => ({ done: true as const, value: undefined }));
+    const a: ProviderAdapter = {
+      name: 'a',
+      models: null,
+      async send() {
+        return {
+          events: {
+            [Symbol.asyncIterator]() {
+              return {
+                next: async () => ({ done: false as const, value: { type: 'error' as const, message: 'boom' } }),
+                return: returned,
+              };
+            },
+          },
+        };
+      },
+    };
+    async function* goodStream(): AsyncGenerator<IRStreamEvent> {
+      yield { type: 'text_delta', text: 'hey' };
+      yield { type: 'finish', reason: 'stop' };
+    }
+    const b: ProviderAdapter = {
+      name: 'b',
+      models: null,
+      async send() {
+        return { events: goodStream() };
+      },
+    };
+    const result = await executeWithFailover(
+      { ...ir, stream: true },
+      [{ provider: 'a', model: 'm' }, { provider: 'b', model: 'm' }],
+      new Map([['a', a], ['b', b]]),
+      new Breakers(),
+    );
+    expect(result.provider).toBe('b');
+    expect(returned).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails over when a stream ends before any event', async () => {
+    async function* empty(): AsyncGenerator<IRStreamEvent> {
+      // no events at all
+    }
+    const a: ProviderAdapter = {
+      name: 'a',
+      models: null,
+      async send() {
+        return { events: empty() };
+      },
+    };
+    async function* goodStream(): AsyncGenerator<IRStreamEvent> {
+      yield { type: 'text_delta', text: 'hey' };
+      yield { type: 'finish', reason: 'stop' };
+    }
+    const b: ProviderAdapter = {
+      name: 'b',
+      models: null,
+      async send() {
+        return { events: goodStream() };
+      },
+    };
+    const result = await executeWithFailover(
+      { ...ir, stream: true },
+      [{ provider: 'a', model: 'm' }, { provider: 'b', model: 'm' }],
+      new Map([['a', a], ['b', b]]),
+      new Breakers(),
+    );
+    expect(result.provider).toBe('b');
+  });
+
+  it('exposes the last provider error when the chain is exhausted', async () => {
+    const a = makeAdapter(() => {
+      throw new ProviderError('upstream 429', {
+        status: 429,
+        retryable: true,
+        provider: 'a',
+        upstreamHeaders: { 'retry-after': '3' },
+      });
+    });
+    const err = await executeWithFailover(
+      ir,
+      [{ provider: 'a', model: 'm' }],
+      new Map([['a', a]]),
+      new Breakers(),
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(NoCandidateError);
+    const noCandidate = err as NoCandidateError;
+    expect(noCandidate.lastError?.status).toBe(429);
+    expect(noCandidate.lastError?.upstreamHeaders?.['retry-after']).toBe('3');
+    expect(noCandidate.attempts).toHaveLength(1);
+  });
+});
+
+describe('classifyUpstreamError', () => {
+  it('retries rate limits, auth, quota, and 5xx', () => {
+    for (const status of [401, 402, 403, 408, 409, 429, 500, 503]) {
+      expect(classifyUpstreamError(status, '')).toEqual({ retryable: true });
+    }
+  });
+
+  it('retries a 404 only when the model is the problem', () => {
+    expect(
+      classifyUpstreamError(404, JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: 'model: claude-x' } })),
+    ).toEqual({ retryable: true });
+    expect(
+      classifyUpstreamError(404, JSON.stringify({ error: { message: "The model 'gpt-x' does not exist", code: 'model_not_found' } })),
+    ).toEqual({ retryable: true });
+    expect(
+      classifyUpstreamError(404, JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: 'Not Found' } })),
+    ).toEqual({ retryable: false });
+    expect(classifyUpstreamError(404, '{"error":"no such endpoint"}')).toEqual({ retryable: false });
+  });
+
+  it('does not retry request-shape errors', () => {
+    expect(classifyUpstreamError(400, '{"error":{"message":"bad"}}')).toEqual({ retryable: false });
+    expect(classifyUpstreamError(422, '{"error":{"message":"bad"}}')).toEqual({ retryable: false });
   });
 });

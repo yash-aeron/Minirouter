@@ -1,5 +1,5 @@
 import { request } from 'undici';
-import { ProviderError, isRetryableStatus } from './types.js';
+import { ProviderError, classifyUpstreamError } from './types.js';
 
 export interface UpstreamOptions {
   method?: string;
@@ -16,6 +16,8 @@ export interface UpstreamResponse {
   body: AsyncIterable<Uint8Array>;
   text: () => Promise<string>;
 }
+
+const MAX_ERROR_BODY = 64 * 1024;
 
 export async function upstreamRequest(
   providerName: string,
@@ -41,15 +43,22 @@ export async function upstreamRequest(
 
   const status = res.statusCode;
   if (status >= 300) {
-    let snippet = '';
+    let raw = '';
     try {
-      snippet = (await res.body.text()).slice(0, 500);
+      raw = (await res.body.text()).slice(0, MAX_ERROR_BODY);
     } catch {
-      snippet = '<unreadable>';
+      raw = '<unreadable>';
     }
+    const { retryable } = classifyUpstreamError(status, raw);
     throw new ProviderError(
-      `${providerName}: upstream ${status}: ${snippet}`,
-      { status, retryable: isRetryableStatus(status), provider: providerName },
+      `${providerName}: upstream ${status}: ${raw.slice(0, 500)}`,
+      {
+        status,
+        retryable,
+        provider: providerName,
+        rawBody: raw,
+        upstreamHeaders: pickRelayHeaders(res.headers),
+      },
     );
   }
 
@@ -59,4 +68,17 @@ export async function upstreamRequest(
     body: res.body as unknown as AsyncIterable<Uint8Array>,
     text: () => res.body.text(),
   };
+}
+
+/** Headers the client needs to make retry and usage-limit decisions. */
+function pickRelayHeaders(headers: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof value !== 'string') continue;
+    const name = key.toLowerCase();
+    if (name === 'retry-after' || name === 'x-should-retry' || name.startsWith('anthropic-ratelimit-')) {
+      out[name] = value;
+    }
+  }
+  return out;
 }
