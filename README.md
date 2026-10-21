@@ -5,9 +5,10 @@ A local AI gateway/router in the spirit of [9Router](https://github.com/decolua/
 ## Features
 
 - **One endpoint, three client APIs**: OpenAI `/v1/chat/completions`, OpenAI `/v1/responses` (Codex), Anthropic `/v1/messages` (Claude Code) — any client can talk to any provider.
-- **Provider types**: `openai-compat` (OpenAI, GLM, DeepSeek, Kimi, MiniMax, Groq, OpenRouter, ...), `anthropic` (native), `gemini` (native).
+- **Provider types**: `openai-compat` (OpenAI, GLM, DeepSeek, Kimi, MiniMax, Groq, OpenRouter, ...), `anthropic` (native), `gemini` (native), plus OAuth-backed `anthropic` (Claude Code), `codex` (ChatGPT), and `gemini-cli` (Google Code Assist).
 - **Fallback chains**: define a route like `claude-sonnet-4-6 -> [glm/glm-4.7, deepseek/deepseek-chat]`; on 401/402/429/5xx/network errors, miniroute retries the next candidate.
-- **Circuit breakers**: providers that fail repeatedly are skipped for a 30s cooldown.
+- **Circuit breakers**: providers that fail repeatedly are skipped for a 30s cooldown; OAuth accounts get one breaker each.
+- **Subscription pooling (opt-in, experimental)**: rotate requests across several Claude Code, Codex, or Gemini CLI accounts, refresh tokens in the background, and fail over when one account is rate-limited. See [Subscription accounts](#subscription-accounts-oauth-experimental).
 - **Streaming failover**: streams fail over *before* the first token reaches the client, so a dead upstream never corrupts a half-delivered answer.
 - **Usage tracking**: every request is logged to SQLite (no native build needed — uses Node's built-in `node:sqlite`); inspect with `GET /v1/usage/summary`.
 - **Security defaults**: binds `127.0.0.1`, per-install random API key (never a shipped default), all `/v1/*` routes behind auth.
@@ -66,6 +67,68 @@ Model names work three ways:
 
 `apiKey` accepts a literal or `env:VAR_NAME` (preferred — the config file holds no secrets). Config is hot-reloaded on change.
 
+## Subscription accounts (OAuth, experimental)
+
+miniroute can spend your own Claude, ChatGPT, or Google subscription instead of an API key. This is
+**opt-in** and deliberately limited to personal accounts. Sign in once per account:
+
+```bash
+miniroute auth login claude --label work     # Claude Code: paste the code shown in the browser
+miniroute auth login codex  --label desk     # ChatGPT: opens a localhost callback (port 1455)
+miniroute auth login gemini --label personal # Google: opens a localhost callback
+miniroute auth list                          # id, provider, label, expiry — never tokens
+miniroute auth refresh [id]                  # refresh one account, or all of them
+miniroute auth remove <id>
+```
+
+Gemini login needs your own Google OAuth client (create a **Desktop app** client in the Google Cloud
+Console). Set both variables when logging in and when running the gateway, so tokens can be
+refreshed:
+
+```bash
+export MINIROUTE_GEMINI_CLIENT_ID=...apps.googleusercontent.com
+export MINIROUTE_GEMINI_CLIENT_SECRET=...
+miniroute auth login gemini --label personal
+```
+
+Use the id from `auth list` (or the label) in a provider:
+
+```json
+{
+  "providers": [
+    { "name": "claude-sub", "type": "anthropic",  "auth": "oauth", "accounts": ["claude-work"] },
+    { "name": "codex-sub",  "type": "codex",      "auth": "oauth", "accounts": ["codex-desk"] },
+    { "name": "gemini-sub", "type": "gemini-cli", "auth": "oauth", "accounts": ["gemini-personal"] }
+  ],
+  "routes": {
+    "claude-sonnet-4-6": ["claude-sub/claude-sonnet-4-6", "glm/glm-4.7"]
+  }
+}
+```
+
+How it behaves:
+
+- Requests rotate round-robin across the provider's `accounts`; each account has its own circuit
+  breaker, so one dead subscription does not take the whole provider out of the chain.
+- Tokens are refreshed five minutes before expiry (one refresh per account even under concurrent
+  load). A 401 triggers one forced refresh, one retry, then normal failover.
+- Claude requests use `Authorization: Bearer` and the OAuth beta flag, and never send `x-api-key`.
+  Codex requests go to the ChatGPT Codex backend in the Responses format. Gemini requests use the
+  Code Assist envelope with the Cloud project discovered at login.
+- Claude login is a paste-the-code flow (`code#state`). Codex and Gemini open a browser and listen
+  on loopback; Codex needs TCP port 1455 free by default (`--port` overrides).
+
+> **Read this before using it.** Claude and Codex reuse OAuth clients published inside the official
+> CLIs; Gemini uses the Google OAuth client you provide. They are not public APIs. Providers can
+> change, rate-limit, or block them at any time, and using them may violate the provider's terms of
+> service. Use only with **your own personal accounts** — never shared, team, or enterprise
+> accounts — and assume an account can be suspended.
+> Codex and Gemini support is experimental. If you need reliability or a contract, use an API key.
+
+Tokens are stored only in `<data dir>/oauth.json` (written atomically with `0600` permissions where
+the platform supports it); they never appear in the config, logs, or command output. `auth list`
+prints only id, provider, label, and expiry. Set `MINIROUTE_HOME` to keep this file somewhere else.
+
 ## Pointing tools at miniroute
 
 API key: run `miniroute key`. Base URL: `http://127.0.0.1:4569`.
@@ -122,9 +185,8 @@ npm run smoke:dist   # after build: starts the dist CLI against a mock upstream
 
 ## Roadmap (not yet built)
 
-- OAuth subscription pooling (Claude Code / Codex / Gemini CLI accounts) — the fragile, ToS-gray part of 9Router; treat carefully.
-- Web dashboard, RTK-style prompt compression, MCP server.
+- More OAuth providers, a web dashboard, RTK-style prompt compression, an MCP server.
 
 ## Security notes
 
-Designed against real CVEs found in this tool category: no hardcoded fallback secrets (the local key is generated and persisted on first run), every `/v1/*` route passes the auth middleware, no remote-command-execution features, server binds loopback by default. OAuth tokens (when implemented) will live in a 0600 file in the data dir.
+Designed against real CVEs found in this tool category: no hardcoded fallback secrets (the local key is generated and persisted on first run), every `/v1/*` route passes the auth middleware, no remote-command-execution features, server binds loopback by default. OAuth tokens live in a `0600` file (`oauth.json`) in the data dir, are written atomically, and are never logged or printed.
