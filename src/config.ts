@@ -60,6 +60,13 @@ export const configSchema = z.object({
   dataDir: z.string().optional(),
   providers: z.array(providerSchema).min(1),
   routes: z.record(z.string(), z.array(z.string())).optional(),
+  /** token saver: compress bulky tool_result text before it goes upstream */
+  tokenSaver: z
+    .object({
+      enabled: z.boolean().optional(),
+      minLines: z.number().int().positive().optional(),
+    })
+    .optional(),
 });
 
 export type AppConfig = z.infer<typeof configSchema>;

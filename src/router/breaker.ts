@@ -40,4 +40,22 @@ export class Breakers {
     if (s.consecutiveFailures >= OPEN_THRESHOLD) s.openedAt = now;
     this.states.set(provider, s);
   }
+
+  /** Current state of every tracked provider, for /v1/status. */
+  snapshot(now = Date.now()): Array<{
+    provider: string;
+    consecutiveFailures: number;
+    open: boolean;
+    cooldownMsLeft: number;
+  }> {
+    return [...this.states.entries()].map(([provider, s]) => {
+      const open = s.openedAt !== null && now - s.openedAt < COOLDOWN_MS;
+      return {
+        provider,
+        consecutiveFailures: s.consecutiveFailures,
+        open,
+        cooldownMsLeft: s.openedAt !== null && open ? Math.max(0, COOLDOWN_MS - (now - s.openedAt)) : 0,
+      };
+    });
+  }
 }

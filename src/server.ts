@@ -1,6 +1,7 @@
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { streamText } from 'hono/streaming';
+import * as path from 'node:path';
 import { AppConfig, loadConfig, watchConfig } from './config.js';
 import { checkAuth } from './auth.js';
 import { buildRegistry, Registry } from './providers/registry.js';
@@ -27,6 +28,9 @@ import {
   responsesRequestToIR,
 } from './core/translate-responses.js';
 import { heartbeat, sseFormat } from './core/sse.js';
+import { applyTokenSaver } from './core/token-saver.js';
+import { DASHBOARD_HTML } from './dashboard.js';
+import { TokenStore } from './oauth/token-store.js';
 import { UsageStore } from './usage/store.js';
 
 type WireFormat = 'anthropic' | 'openai' | 'responses';
@@ -37,6 +41,7 @@ interface State {
   breakers: Breakers;
   chain: ChainResolver;
   usage: UsageStore;
+  tokenStore?: TokenStore;
 }
 
 interface AppOptions {
@@ -142,6 +147,12 @@ export function createApp(opts: AppOptions): Hono {
 
   app.get('/healthz', (c) => c.json({ ok: true }));
 
+  // Static dashboard shell: no data lives here, the page authenticates every
+  // fetch against /v1/* with the local API key.
+  app.get('/dashboard', (c) =>
+    c.html(DASHBOARD_HTML),
+  );
+
   app.get('/v1/models', (c) => {
     const models = opts.state.chain.listModels();
     return c.json({
@@ -152,6 +163,45 @@ export function createApp(opts: AppOptions): Hono {
 
   app.get('/v1/usage/summary', (c) => {
     return c.json(opts.state.usage.summary());
+  });
+
+  app.get('/v1/status', (c) => {
+    const config = opts.state.config;
+    const breakers = new Map(opts.state.breakers.snapshot().map((s) => [s.provider, s]));
+    const accountsByKind = new Map<string, number>();
+    if (opts.state.tokenStore) {
+      for (const { provider } of opts.state.tokenStore.all()) {
+        accountsByKind.set(provider, (accountsByKind.get(provider) ?? 0) + 1);
+      }
+    }
+    const kindFor = (type: string) =>
+      type === 'anthropic' ? 'claude' : type === 'codex' ? 'codex' : type === 'gemini-cli' ? 'gemini' : '';
+    const providers = config.providers.map((p) => {
+      const kind = kindFor(p.type);
+      let origin = '';
+      try {
+        origin = new URL(p.baseUrl ?? '').origin;
+      } catch {
+        origin = '';
+      }
+      return {
+        name: p.name,
+        type: p.type,
+        auth: p.auth ?? 'api-key',
+        baseUrl: origin,
+        models: p.models ?? null,
+        accounts:
+          p.auth === 'oauth' && kind ? `${accountsByKind.get(kind) ?? 0} ${kind} account(s)` : '-',
+        breaker: breakers.get(p.name) ?? { consecutiveFailures: 0, open: false, cooldownMsLeft: 0 },
+      };
+    });
+    return c.json({
+      tokenSaver: {
+        enabled: config.tokenSaver?.enabled !== false,
+        minLines: config.tokenSaver?.minLines ?? 10,
+      },
+      providers,
+    });
   });
 
   const respondError = (c: any, info: ErrorInfo): Response => {
@@ -232,6 +282,19 @@ export function createApp(opts: AppOptions): Hono {
       }
       ir.clientHeaders = collectClientHeaders(c.req.raw.headers);
 
+      // Token saver: compress bulky tool-result text before routing. Per-
+      // request bypass with the x-miniroute-token-saver: off header.
+      let savedTokens = 0;
+      if (
+        opts.state.config.tokenSaver?.enabled !== false &&
+        c.req.header('x-miniroute-token-saver')?.toLowerCase() !== 'off'
+      ) {
+        const saver = applyTokenSaver(ir, {
+          minLines: opts.state.config.tokenSaver?.minLines ?? 10,
+        });
+        savedTokens = saver.savedTokens;
+      }
+
       try {
         const warnings: string[] = [];
         const candidates = opts.state.chain.resolve(ir.model, warnings);
@@ -279,6 +342,7 @@ export function createApp(opts: AppOptions): Hono {
                   ok: !failure,
                   ...(failure ? { error: failure.slice(0, 500) } : {}),
                   durationMs: Date.now() - started,
+                  savedTokens,
                 });
               }
             }
@@ -300,6 +364,7 @@ export function createApp(opts: AppOptions): Hono {
             cacheWriteTokens: resp.usage.cacheWriteTokens ?? 0,
             ok: true,
             durationMs: Date.now() - started,
+            savedTokens,
           });
         }
         return respondNonStreaming(c, result, result.model);
@@ -318,6 +383,7 @@ export function createApp(opts: AppOptions): Hono {
           ok: false,
           error: info.message.slice(0, 500),
           durationMs: Date.now() - started,
+          savedTokens: 0,
         });
         return respondError(c, info);
       }
@@ -378,12 +444,14 @@ export async function runServer(runOpts: RunOptions): Promise<{ close: () => voi
   const authEnabled = config.auth !== false;
 
   const usage = new UsageStore(runOpts.dataDir);
+  const tokenStore = new TokenStore(path.join(runOpts.dataDir, 'oauth.json'));
   let state: State = {
     config,
-    registry: buildRegistry(config, { dataDir: runOpts.dataDir }),
+    registry: buildRegistry(config, { dataDir: runOpts.dataDir, tokenStore }),
     breakers: new Breakers(),
     chain: new ChainResolver(config),
     usage,
+    tokenStore,
   };
 
   let rebuild = () => {
@@ -391,10 +459,11 @@ export async function runServer(runOpts: RunOptions): Promise<{ close: () => voi
       const next = loadConfig(runOpts.configPath);
       state = {
         config: next.config,
-        registry: buildRegistry(next.config, { dataDir: runOpts.dataDir }),
+        registry: buildRegistry(next.config, { dataDir: runOpts.dataDir, tokenStore }),
         breakers: new Breakers(),
         chain: new ChainResolver(next.config),
         usage,
+        tokenStore,
       };
       console.log(`[miniroute] config reloaded (${next.warnings.length} warning(s))`);
       for (const w of next.warnings) console.warn(`[miniroute] warning: ${w}`);

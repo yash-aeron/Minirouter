@@ -18,6 +18,8 @@ export interface UsageRecord {
   ok: boolean;
   error?: string;
   durationMs: number;
+  /** token-saver estimate for this request */
+  savedTokens?: number;
 }
 
 export class UsageStore {
@@ -44,6 +46,11 @@ export class UsageStore {
       );
       CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
     `);
+    try {
+      this.db.exec('ALTER TABLE requests ADD COLUMN saved_tokens INTEGER NOT NULL DEFAULT 0;');
+    } catch {
+      // column already exists (pre-0.2 databases)
+    }
   }
 
   insert(r: UsageRecord): void {
@@ -51,8 +58,8 @@ export class UsageStore {
       .prepare(
         `INSERT INTO requests
          (ts, route, provider, model, stream, input_tokens, output_tokens,
-          cache_read_tokens, cache_write_tokens, ok, error, duration_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          cache_read_tokens, cache_write_tokens, ok, error, duration_ms, saved_tokens)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         r.ts,
@@ -67,6 +74,7 @@ export class UsageStore {
         r.ok ? 1 : 0,
         r.error ?? null,
         r.durationMs,
+        r.savedTokens ?? 0,
       );
   }
 
@@ -78,7 +86,8 @@ export class UsageStore {
                 COALESCE(SUM(input_tokens), 0) AS input_tokens,
                 COALESCE(SUM(output_tokens), 0) AS output_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-                COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens
+                COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                COALESCE(SUM(saved_tokens), 0) AS saved_tokens
          FROM requests`,
       )
       .get() as Record<string, number>;
@@ -86,7 +95,8 @@ export class UsageStore {
       .prepare(
         `SELECT provider, COUNT(*) AS requests,
                 COALESCE(SUM(input_tokens), 0) AS input_tokens,
-                COALESCE(SUM(output_tokens), 0) AS output_tokens
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(saved_tokens), 0) AS saved_tokens
          FROM requests GROUP BY provider ORDER BY requests DESC`,
       )
       .all() as Array<Record<string, unknown>>;
@@ -101,7 +111,7 @@ export class UsageStore {
     const recent = this.db
       .prepare(
         `SELECT ts, route, provider, model, stream, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, ok, error, duration_ms
+                cache_read_tokens, cache_write_tokens, ok, error, duration_ms, saved_tokens
          FROM requests ORDER BY ts DESC LIMIT 50`,
       )
       .all() as Array<Record<string, unknown>>;

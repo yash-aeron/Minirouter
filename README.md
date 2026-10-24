@@ -10,7 +10,9 @@ A local AI gateway/router in the spirit of [9Router](https://github.com/decolua/
 - **Circuit breakers**: providers that fail repeatedly are skipped for a 30s cooldown; OAuth accounts get one breaker each.
 - **Subscription pooling (opt-in, experimental)**: rotate requests across several Claude Code, Codex, or Gemini CLI accounts, refresh tokens in the background, and fail over when one account is rate-limited. See [Subscription accounts](#subscription-accounts-oauth-experimental).
 - **Streaming failover**: streams fail over *before* the first token reaches the client, so a dead upstream never corrupts a half-delivered answer.
-- **Usage tracking**: every request is logged to SQLite (no native build needed — uses Node's built-in `node:sqlite`); inspect with `GET /v1/usage/summary`.
+- **Usage tracking**: every request is logged to SQLite (no native build needed — uses Node's built-in `node:sqlite`); inspect with `GET /v1/usage/summary` or the built-in dashboard.
+- **Token saver**: compresses bulky tool-result text (repeated log lines, long command output) before it goes upstream, and logs the estimated savings per request. On by default; bypass per request with the `x-miniroute-token-saver: off` header.
+- **Dashboard**: open `http://127.0.0.1:4569/dashboard` for usage stats, token-saver savings, provider health, and breaker state. The page itself holds no data — it authenticates every fetch with your local API key.
 - **Security defaults**: binds `127.0.0.1`, per-install random API key (never a shipped default), all `/v1/*` routes behind auth.
 
 ## Requirements
@@ -55,9 +57,12 @@ miniroute doctor
   ],
   "routes": {
     "claude-sonnet-4-6": ["anthropic/claude-sonnet-4-6", "glm/glm-4.7", "deepseek/deepseek-chat"]
-  }
+  },
+  "tokenSaver": { "enabled": true, "minLines": 10 }
 }
 ```
+
+`tokenSaver` controls the built-in token saver: when a tool-result text block has at least `minLines` lines, runs of 3+ identical consecutive lines are collapsed to two plus an inline `[miniroute: collapsed N identical consecutive lines]` marker. Only provably redundant text is touched, the estimate lands in usage tracking as `saved_tokens`, and any request can opt out with the `x-miniroute-token-saver: off` header. Set `"enabled": false` to turn it off entirely.
 
 Model names work three ways:
 
@@ -171,6 +176,8 @@ export OPENAI_API_KEY=<miniroute key>
 | `POST /v1/responses` | OpenAI Responses (Codex) |
 | `GET /v1/models` | Union of provider models + route aliases |
 | `GET /v1/usage/summary` | Totals, per-provider, per-model, recent requests |
+| `GET /v1/status` | Providers (type, auth, accounts), breaker states, token-saver settings |
+| `GET /dashboard` | Web dashboard (static shell; the page authenticates its own fetches) |
 | `GET /healthz` | Liveness (no auth) |
 
 ## Development
@@ -185,7 +192,7 @@ npm run smoke:dist   # after build: starts the dist CLI against a mock upstream
 
 ## Roadmap (not yet built)
 
-- More OAuth providers, a web dashboard, RTK-style prompt compression, an MCP server.
+- More OAuth providers, an MCP server.
 
 ## Security notes
 
